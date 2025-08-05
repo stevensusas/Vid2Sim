@@ -64,7 +64,7 @@ Following the steps in this section, you can run our whole pipeline to reconstru
 
    The **frames** will be generated at `outputs/bus`(left video is **ground-truth** and right video is **reconstruction**)
 
-   <img src="assets/bus_gt.gif" alt="bus_gt" style="zoom:60%;" /> <img src="assets/bus_recon.gif" alt="bus_recon" style="zoom:60%;" />
+   <img src="assets/bus.gif" alt="bus_gt" style="zoom:100%;" />
    
    
 
@@ -102,13 +102,13 @@ Due to policy restrictions, we are not able to release **the originals objaverse
        |-- objaverse
        	|-- ...
        	|-- outputs
-       		|-- ...
-       		|-- 0a81d18db3c947fbbdc8d60edd1ef323
-                   |--meshes	
-                   |--models
-                   |--renderings
-                   |--gt_phys_params.yaml
-                   └--mesh.glb
+       	    |-- ...
+       	    |-- 0a81d18db3c947fbbdc8d60edd1ef323
+       	        |--meshes	
+       	        |--models
+       	        |--renderings
+       	        |--gt_phys_params.yaml
+       	        └--mesh.glb
    ```
 
 4. Train the feed-forward predictor with rendered animations (you are also recommended to use **224x224** resolution for training since it's much faster to train and performs good)
@@ -145,4 +145,5 @@ If you find this repository useful in your project, welcome to cite our work :)
   year={2025}
 }
 ```
+
 
