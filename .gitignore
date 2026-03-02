@@ -5,3 +5,9 @@ dataset/objaverse
 checkpoints/
 outputs/
 debug/
+ckpt_lbs_template.pth
+*.pth
+
+# Symlinks to external data
+checkpoints
+outputs

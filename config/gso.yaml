@@ -2,10 +2,11 @@ model_type: gs
 view_samples: 12
 floor_level: -0.7
 floor_axis: 2
+flip_floor: false
 delta_t: 0.05
 particle_volume: 1
 rho: 1000
-penalty_weight: 1e5
+penalty_weight: 1e7
 num_cubature_points: 500
 num_handles: 10
 refine_lbs_iters: 10000

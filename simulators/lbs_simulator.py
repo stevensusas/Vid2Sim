@@ -30,8 +30,9 @@ class LBSSimulator():
         self.output_dir = output_dir
         self.data_name = data_name
 
-        self.floor_level = args.floor_level
+        self.floor_level = args.floor_level - 0.90
         self.floor_axis = args.floor_axis
+        self.flip_floor = getattr(args, 'flip_floor', False)
         self.delta_t = args.delta_t
         self.particle_volume = args.particle_volume
         self.rho = args.rho
@@ -62,8 +63,11 @@ class LBSSimulator():
             self.total_view_indices = torch.arange(0, 1, 1) 
             self.ref = None
          
+        self.points = self.points.clone()
+        self.points[:, self.floor_axis] += 0.0
+
         self.cubature_points, self.cubature_points_idx = load_cubature_points(self.points, self.num_cubature_points)
-        self.points = self.points.to(device)  
+        self.points = self.points.to(device)
 
         if gaussians is not None:
             self.gaussians = gaussians 
@@ -95,7 +99,7 @@ class LBSSimulator():
                                                 {'params': self.jacobian_model.parameters(), 'lr': 5e-7}])
             print(f'[Joint Optimization] Initial Material Parameters: E={init_yms} ν={init_prs}')
         else:
-            self.yms, self.prs = self.args.yms, self.args.prs
+            self.yms, self.prs = self.args.yms, min(self.args.prs, 0.49)
             self.point_wise_yms = torch.ones_like(self.points[:, 0:1]) * self.yms
             self.point_wise_prs = torch.ones_like(self.points[:, 0:1]) * self.prs
             self.cubature_point_wise_yms = torch.ones_like(self.cubature_points[:, 0:1]) * self.yms
@@ -105,7 +109,7 @@ class LBSSimulator():
             print(f'[Simulation] Material Parameters: E={self.yms} ν={self.prs}')
              
         self.grav = torch.zeros(3, device=self.device)
-        self.grav[self.floor_axis] = 9.8
+        self.grav[self.floor_axis] = 7.5
     
     def set_lbs(self):
         self.lbs_model_plus_rigid = lambda x: torch.cat((self.lbs_model(x),
@@ -202,7 +206,8 @@ class LBSSimulator():
         self.z_dot = torch.zeros_like(self.z, device=self.device) 
         self.current_step = 0
         self.save_list = []
-        self.save_list_bg = [] 
+        self.save_list_bg = []
+        self.save_list_pts = []
 
     def initialize_simulator(self):
  
@@ -215,7 +220,8 @@ class LBSSimulator():
 
         if self.optimization:
             self.cubature_point_wise_yms = torch.ones_like(self.cubature_points[:, 0:1]) * torch.pow(10, self.pred_yms_normalized)
-            self.cubature_point_wise_prs = torch.ones_like(self.cubature_points[:, 0:1]) * self.pred_prs_normalized
+            clamped_prs = torch.clamp(self.pred_prs_normalized, -0.99, 0.49)
+            self.cubature_point_wise_prs = torch.ones_like(self.cubature_points[:, 0:1]) * clamped_prs
         
         if self.dFdz is None or self.optimization:
             self.M, self.invM = physics.simplicits.precomputed.lumped_mass_matrix(self.cubature_point_wise_rho, self.particle_volume, dim=3)
@@ -233,7 +239,7 @@ class LBSSimulator():
  
         self.material_object = NeohookeanMaterial(self.cubature_point_wise_yms, self.cubature_point_wise_prs) 
         self.gravity_object = physics.utils.Gravity(rhos=self.cubature_point_wise_rho, acceleration=self.grav)
-        self.floor_object = physics.utils.Floor(floor_height=self.floor_level, floor_axis=self.floor_axis)
+        self.floor_object = physics.utils.Floor(floor_height=self.floor_level, floor_axis=self.floor_axis, flip_floor=self.flip_floor)
         self.integration_sampling = torch.as_tensor(self.particle_volume / self.num_cubature_points,
             device=self.device, dtype=torch.float32) 
 
@@ -289,6 +295,11 @@ class LBSSimulator():
                 self.gs_context['gs_background'], self.dataset_dir, self.data_name)
             self.save_list.append(torch.stack(renderings, dim=0))
             self.save_list_bg.append(torch.stack(rendering_bg, dim=0))
+            if step == 0:
+                x_cubature = self.cubature_points
+            else:
+                x_cubature = (self.B @ self.z + self.x0_flat).reshape(-1, 3)
+            self.save_list_pts.append(x_cubature.clone().detach().cpu().numpy())
         elif self.args.model_type == 'mesh':
             self.save_list.append(x_pts_full.clone().detach().cpu().numpy())
 
@@ -301,6 +312,112 @@ class LBSSimulator():
             for frame_idx in range(renderings.shape[1]):
                 torchvision.utils.save_image(renderings[view_idx, frame_idx], f'{save_path}/m_{view_idx}_{frame_idx}.png')
                 torchvision.utils.save_image(renderings_bg[view_idx, frame_idx], f'{save_path}/r_{view_idx}_{frame_idx}.png')
+
+    def save_pointcloud_gif(self, save_name, fps=20, annotation=None):
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+        import imageio
+        from PIL import Image
+
+        save_path = f'{self.output_dir}/{self.data_name}/render_{save_name}'
+        out_path  = f'{self.output_dir}/{self.data_name}/recon_pts.gif'
+        gt_dir    = f'{self.dataset_dir}/{self.data_name}/data'
+
+        all_pts = np.concatenate(self.save_list_pts, axis=0)
+        pad  = 0.15
+        xlim = (all_pts[:, 0].min() - pad, all_pts[:, 0].max() + pad)
+        ylim = (all_pts[:, 1].min() - pad, all_pts[:, 1].max() + pad)
+        zlim = (min(all_pts[:, 2].min() - pad, self.floor_level - pad), all_pts[:, 2].max() + pad)
+
+        GT_TINT = np.array([0.6, 1.0, 0.6], dtype=float)
+        RC_TINT = np.array([1.0, 0.6, 1.0], dtype=float)
+
+        if annotation:
+            annot_text = (f"Best Iter: {annotation.get('iter', '?')}    "
+                          f"E = {annotation.get('E', 0):.0f} Pa    "
+                          f"ν = {annotation.get('nu', 0):.4f}    "
+                          f"PSNR = {annotation.get('psnr', 0):.2f} dB    "
+                          f"SSIM = {annotation.get('ssim', 0):.4f}")
+        else:
+            annot_text = ''
+
+        BG = 'white'
+        LABEL_COLOR = '#222222'
+        LABEL_FS = 13
+
+        frames = []
+        for frame_idx, pts in enumerate(self.save_list_pts):
+
+            # ── load images ──────────────────────────────────────────────────
+            gt_path = f'{gt_dir}/r_0_{frame_idx}.png'
+            rc_path = f'{save_path}/r_0_{frame_idx}.png'
+            blank   = np.full((448, 448, 3), 200, dtype=np.uint8)
+            gt_img  = np.array(Image.open(gt_path).convert('RGB')) if os.path.exists(gt_path) else blank
+            rc_img  = np.array(Image.open(rc_path).convert('RGB')) if os.path.exists(rc_path) else blank
+            overlay = np.clip(0.5 * gt_img.astype(float) * GT_TINT +
+                              0.5 * rc_img.astype(float) * RC_TINT, 0, 255).astype(np.uint8)
+            H, W = gt_img.shape[:2]
+
+            # ── render 3-D point cloud to a numpy image ───────────────────────
+            fig3d = plt.figure(figsize=(W / 100, H / 100), dpi=100)
+            fig3d.patch.set_facecolor(BG)
+            ax3d = fig3d.add_subplot(1, 1, 1, projection='3d')
+            ax3d.set_facecolor('#f5f5f5')
+            stride = max(1, len(pts) // 2000)
+            p = pts[::stride]
+            ax3d.scatter(p[:, 0], p[:, 1], p[:, 2], c=p[:, 2], cmap='viridis', s=1, alpha=0.7)
+            xs, ys = np.linspace(*xlim, 4), np.linspace(*ylim, 4)
+            xx, yy = np.meshgrid(xs, ys)
+            ax3d.plot_surface(xx, yy, np.full_like(xx, self.floor_level),
+                              alpha=0.25, color='saddlebrown')
+            ax3d.set_xlim(xlim); ax3d.set_ylim(ylim); ax3d.set_zlim(zlim)
+            ax3d.set_xlabel('X'); ax3d.set_ylabel('Y'); ax3d.set_zlabel('Z')
+            ax3d.tick_params(labelsize=6)
+            ax3d.view_init(elev=20, azim=45)
+            fig3d.tight_layout(pad=0.2)
+            fig3d.canvas.draw()
+            buf3d = np.frombuffer(fig3d.canvas.buffer_rgba(), dtype=np.uint8)
+            w3d, h3d = fig3d.canvas.get_width_height()
+            pc_img = buf3d.reshape(h3d, w3d, 4)[:, :, :3]
+            plt.close(fig3d)
+            pc_img = np.array(Image.fromarray(pc_img).resize((W, H), Image.LANCZOS))
+
+            # ── compose 4-panel figure ────────────────────────────────────────
+            panel_imgs   = [gt_img, rc_img, pc_img, overlay]
+            panel_titles = ['GT', 'Reconstructed', 'Cubature Points', 'Overlay']
+
+            fig = plt.figure(figsize=(4 * W / 100, (H / 100) + 1.0), dpi=100)
+            fig.patch.set_facecolor(BG)
+            gs = GridSpec(2, 4, figure=fig,
+                          height_ratios=[H, 80], hspace=0.05, wspace=0.02,
+                          left=0.01, right=0.99, top=0.92, bottom=0.01)
+
+            for col, (img, title) in enumerate(zip(panel_imgs, panel_titles)):
+                ax = fig.add_subplot(gs[0, col])
+                ax.imshow(img)
+                ax.set_title(title, fontsize=LABEL_FS, fontweight='bold',
+                             color=LABEL_COLOR, pad=5)
+                ax.axis('off')
+
+            # annotation bar
+            ax_ann = fig.add_subplot(gs[1, :])
+            ax_ann.set_facecolor('#eeeeee')
+            ax_ann.axis('off')
+            ax_ann.text(0.5, 0.5, annot_text,
+                        transform=ax_ann.transAxes,
+                        ha='center', va='center',
+                        fontsize=12, fontweight='bold', color='#111111')
+
+            fig.canvas.draw()
+            buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            fw, fh = fig.canvas.get_width_height()
+            frames.append(buf.reshape(fh, fw, 4)[:, :, :3])
+            plt.close(fig)
+
+        imageio.mimsave(out_path, frames, fps=fps, loop=0)
+        print(f'Saved point cloud GIF to {out_path}')
 
     def calculate_loss(self, view_indices=None, start_step=0, end_step=-1):
         images_gt = self.ref[view_indices, start_step:end_step]

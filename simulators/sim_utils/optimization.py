@@ -100,9 +100,16 @@ def newtons_method(x, energy_fcn, gradient_fcn, hessian_fcn, max_iters=10):
         newton_G = gradient_fcn(x) 
         newton_H = hessian_fcn(x) 
 
-        if torch.det(newton_H) == 0:
-            newton_H = newton_H + 1e-4 * torch.eye(newton_H.shape[0], device=x.device)
-        p = -torch.linalg.solve(newton_H, newton_G)
+        reg_scale = 1e-6
+        eye = torch.eye(newton_H.shape[0], device=x.device)
+        for attempt in range(5):
+            try:
+                p = -torch.linalg.solve(newton_H + reg_scale * eye, newton_G)
+                break
+            except torch._C._LinAlgError:
+                reg_scale *= 1e3
+        else:
+            break
         if (torch.abs(newton_G.t() @ p) < 1e-3):
             break
         last_alpha = 10

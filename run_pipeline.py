@@ -8,7 +8,10 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 import numpy as np
-import tyro 
+import tyro
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
  
 from tqdm import trange
 from omegaconf import OmegaConf
@@ -34,6 +37,16 @@ from gs.utils.general_utils import safe_state
 from simulators.lbs_simulator import LBSSimulator
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _merge_per_case_sim_config(sim_args, dataset_dir, data_name):
+    """Override sim_args with per-case sim_config.yaml if present (e.g. floor convention from PhysTwin)."""
+    sim_config_path = os.path.join(dataset_dir, data_name, 'sim_config.yaml')
+    if os.path.isfile(sim_config_path):
+        case_cfg = OmegaConf.load(sim_config_path)
+        sim_args = OmegaConf.merge(sim_args, case_cfg)
+        print(f"[Config] Merged per-case sim_config from {sim_config_path}")
+    return sim_args
 
 def predict_phys_params(args):
 
@@ -215,6 +228,7 @@ def refine_lbs(args):
     with open(f'{args.output_dir}/{args.data_name}/init_params.yaml', 'r') as f:
         init_params = OmegaConf.load(f)
     sim_args = OmegaConf.load(args.config) 
+    sim_args = _merge_per_case_sim_config(sim_args, args.dataset_dir, args.data_name)
     sim_args.tag = 'base' 
     sim_args.yms = init_params.init_yms
     sim_args.prs = init_params.init_prs 
@@ -236,6 +250,7 @@ def joint_optimization(args):
     with open(f'{args.output_dir}/{args.data_name}/init_params.yaml', 'r') as f:
         init_params = OmegaConf.load(f)
     sim_args = OmegaConf.load(args.config) 
+    sim_args = _merge_per_case_sim_config(sim_args, args.dataset_dir, args.data_name)
     sim_args.tag = 'base' 
     sim_args.yms = init_params.init_yms
     sim_args.prs = init_params.init_prs 
@@ -268,7 +283,8 @@ def joint_optimization(args):
             if psnr > best_psnr and ssim > best_ssim: # Save the best model
                 best_psnr, best_ssim = psnr, ssim
                 record['best_psnr'], record['best_ssim'] = psnr.item(), ssim.item()
-                best_params.yms, best_params.prs = yms_pred.item(), prs_pred.item()
+                best_params.yms = yms_pred.item()
+                best_params.prs = min(prs_pred.item(), 0.49)
                 OmegaConf.save(best_params, f'{args.output_dir}/{args.data_name}/best_params.yaml')
                 torch.save(simulator.lbs_model.state_dict(), f'{args.output_dir}/{args.data_name}/models/model_best.pth')
                 torch.save(simulator.jacobian_model.state_dict(), f'{args.output_dir}/{args.data_name}/models/jmodel_best.pth') 
@@ -287,12 +303,92 @@ def joint_optimization(args):
         with open(f'{args.output_dir}/{args.data_name}/optimization_record.json', 'w') as f:
             json.dump(record, f)
 
+def plot_optimization_record(args):
+    record_path = f'{args.output_dir}/{args.data_name}/optimization_record.json'
+    with open(record_path, 'r') as f:
+        record = json.load(f)
+
+    test_list = record.get('test_list', [])
+    train_list = record.get('train_list', [])
+    if not test_list:
+        print("No optimization record to plot.")
+        return
+
+    checkpoint_interval = len(train_list) // max(len(test_list) - 1, 1) if len(test_list) > 1 else 10
+    test_iters = [i * checkpoint_interval for i in range(len(test_list))]
+
+    psnr_vals = [d['psnr'] for d in test_list]
+    ssim_vals = [d['ssim'] for d in test_list]
+    yms_vals  = [d['yms']  for d in test_list]
+    prs_vals  = [d['prs']  for d in test_list]
+
+    best_psnr = record.get('best_psnr', max(psnr_vals))
+    best_ssim = record.get('best_ssim', max(ssim_vals))
+    best_idx  = next((i for i, d in enumerate(test_list)
+                      if d['psnr'] == best_psnr and d['ssim'] == best_ssim), None)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle(f'Optimization Record — {args.data_name}', fontsize=14)
+
+    for ax, vals, label, color in zip(
+        axes.flat,
+        [psnr_vals, ssim_vals, yms_vals, prs_vals],
+        ['PSNR (dB)', 'SSIM', "Young's Modulus E (Pa)", 'Poisson Ratio ν'],
+        ['steelblue', 'darkorange', 'forestgreen', 'mediumpurple']
+    ):
+        ax.plot(test_iters, vals, color=color, linewidth=2)
+        if best_idx is not None:
+            ax.axvline(test_iters[best_idx], color='red', linestyle='--', linewidth=1.2, label=f'Best (iter {test_iters[best_idx]})')
+            ax.scatter([test_iters[best_idx]], [vals[best_idx]], color='red', zorder=5)
+            ax.legend(fontsize=8)
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out_path = f'{args.output_dir}/{args.data_name}/optimization_record.png'
+    plt.savefig(out_path, dpi=120)
+    plt.close()
+    print(f"Saved optimization plot → {out_path}")
+
+
+def save_overlay_gif(args):
+    out_dir   = f'{args.output_dir}/{args.data_name}'
+    gt_dir    = f'{args.dataset_dir}/{args.data_name}/data'
+    render_dir = f'{out_dir}/render_best'
+    n_frames  = 16
+
+    gt_frames, rc_frames = [], []
+    for i in range(n_frames):
+        gt_path = f'{gt_dir}/r_0_{i}.png'
+        rc_path = f'{render_dir}/r_0_{i}.png'
+        if not os.path.exists(gt_path) or not os.path.exists(rc_path):
+            print(f"Missing frame {i}, skipping overlay GIF.")
+            return
+        gt_frames.append(np.array(Image.open(gt_path).convert('RGB')))
+        rc_frames.append(np.array(Image.open(rc_path).convert('RGB')))
+
+    # GT tinted green, recon tinted magenta — misaligned regions show as color fringing
+    GT_TINT  = np.array([0.6, 1.0, 0.6], dtype=float)   # greenish
+    RC_TINT  = np.array([1.0, 0.6, 1.0], dtype=float)   # magenta
+
+    blended = []
+    for gt, rc in zip(gt_frames, rc_frames):
+        blend = np.clip(0.5 * gt.astype(float) * GT_TINT + 0.5 * rc.astype(float) * RC_TINT, 0, 255).astype(np.uint8)
+        blended.append(blend)
+
+    imageio.mimsave(f'{out_dir}/overlay.gif', blended, fps=8, loop=0)
+    print(f"Saved overlay GIF → {out_dir}/overlay.gif")
+
+
 def final_simulation(args):
 
     print(f"[[Stage II]] Final simulation for {args.data_name}")
     with open(f'{args.output_dir}/{args.data_name}/best_params.yaml', 'r') as f:
         best_params = OmegaConf.load(f)
     sim_args = OmegaConf.load(args.config) 
+    sim_args = _merge_per_case_sim_config(sim_args, args.dataset_dir, args.data_name)
     sim_args.tag = 'best' 
     sim_args.yms = best_params.yms
     sim_args.prs = best_params.prs 
@@ -307,6 +403,24 @@ def final_simulation(args):
     psnr, ssim = simulator.calculate_metrics(view_indices=simulator.total_view_indices, end_step=16)
     print(f"After joint optimization -- PSNR: {psnr.item()}, SSIM: {ssim.item()}")
 
+    # Load best iter from optimization record
+    best_iter = '?'
+    record_path = f'{args.output_dir}/{args.data_name}/optimization_record.json'
+    if os.path.exists(record_path):
+        with open(record_path) as f:
+            record = json.load(f)
+        best_psnr_rec = record.get('best_psnr', None)
+        best_ssim_rec = record.get('best_ssim', None)
+        checkpoint_interval = len(record.get('train_list', [])) // max(len(record.get('test_list', [1])) - 1, 1)
+        for i, d in enumerate(record.get('test_list', [])):
+            if d['psnr'] == best_psnr_rec and d['ssim'] == best_ssim_rec:
+                best_iter = i * checkpoint_interval
+                break
+
+    annotation = dict(iter=best_iter, E=best_params.yms, nu=best_params.prs,
+                      psnr=psnr.item(), ssim=ssim.item())
+    simulator.save_pointcloud_gif(simulator.tag, annotation=annotation)
+
     # Visualize the simulation results at front view
     output_dir = f'{args.output_dir}/{args.data_name}/render_best'
     gt_dir = f'{args.dataset_dir}/{args.data_name}/data'
@@ -318,6 +432,9 @@ def final_simulation(args):
     gt_imgs = np.stack(gt_imgs, axis=0) 
     imageio.mimsave(f'{args.output_dir}/{args.data_name}/recon.gif', pred_imgs, fps=20, loop=0)
     imageio.mimsave(f'{args.output_dir}/{args.data_name}/gt.gif', gt_imgs, fps=20, loop=0)
+
+    plot_optimization_record(args)
+    save_overlay_gif(args)
 
 def run_recon(args):
 
@@ -337,7 +454,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/gso.yaml") 
-    parser.add_argument("--dataset_dir", type=str, default="dataset/GSO")
+    parser.add_argument("--dataset_dir", type=str, default="dataset")
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--data_name", type=str, default="bus")
     parser.add_argument("--ckpt_predictor", type=str, default="checkpoints/ckpt_phys_predictor.pth")

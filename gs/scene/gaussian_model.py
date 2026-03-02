@@ -156,9 +156,20 @@ class GaussianModel:
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
-        num_pts = xyz.shape[0]
-        shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+        # Align LGM gaussians to the dataset point-cloud frame so 3DGS refinement
+        # starts from a compatible global scale/center.
+        scale_factor = 1.0
+        if pcd is not None and hasattr(pcd, "points"):
+            ref_xyz = np.asarray(pcd.points)
+            if ref_xyz.size > 0:
+                src_min, src_max = xyz.min(axis=0), xyz.max(axis=0)
+                ref_min, ref_max = ref_xyz.min(axis=0), ref_xyz.max(axis=0)
+                src_extent = src_max - src_min
+                ref_extent = ref_max - ref_min
+                valid = src_extent > 1e-8
+                if np.any(valid):
+                    scale_factor = float(np.mean(ref_extent[valid] / src_extent[valid]))
+                xyz = (xyz - (src_min + src_max) * 0.5) * scale_factor + (ref_min + ref_max) * 0.5
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
@@ -184,13 +195,23 @@ class GaussianModel:
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
             scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        if scales.shape[1] > 0 and scale_factor > 0:
+            # Stored scales are log-space radii; world-scale alignment adds log(s).
+            scales += np.log(max(scale_factor, 1e-8))
  
         rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
         rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
- 
+
+        # Mirror the quaternion to match the Y/Z axis flip above.
+        # For M=diag(1,-1,-1), M R M has quaternion (w, x, -y, -z).
+        # rots columns are stored as (w=0, x=1, y=2, z=3).
+        if rots.shape[1] >= 4:
+            rots[:, 2] *= -1
+            rots[:, 3] *= -1
+
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -198,7 +219,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda() 
+        fused_point_cloud = torch.tensor(xyz).float().cuda()
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True)) 
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
@@ -459,7 +480,7 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
-        bounding_box_mask = torch.max(self.get_xyz.abs(), dim=1).values > 0.5
+        bounding_box_mask = torch.max(self.get_xyz.abs(), dim=1).values > extent
         prune_mask = torch.logical_or(prune_mask, bounding_box_mask)
         
         if max_screen_size:
