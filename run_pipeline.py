@@ -48,6 +48,98 @@ def _merge_per_case_sim_config(sim_args, dataset_dir, data_name):
         print(f"[Config] Merged per-case sim_config from {sim_config_path}")
     return sim_args
 
+
+def _project_to_2d(pts_3d, camera):
+    """Project 3D points (N, 3) to 2D pixel coords (N, 2) via full_proj_transform."""
+    ones = torch.ones(pts_3d.shape[0], 1, device=pts_3d.device)
+    pts_h = torch.cat([pts_3d, ones], dim=1)             # (N, 4)
+    pts_clip = pts_h @ camera.full_proj_transform         # (N, 4)
+    pts_ndc = pts_clip[:, :3] / pts_clip[:, 3:4]          # (N, 3)
+    px = (pts_ndc[:, 0] + 1) / 2 * camera.image_width
+    py = (pts_ndc[:, 1] + 1) / 2 * camera.image_height
+    return torch.stack([px, py], dim=1)                   # (N, 2)
+
+
+def _run_cotracker_multiview(simulator, dataset_dir, data_name, n_frames=16):
+    """Run CoTracker on all views using projected cubature points as queries.
+    Returns tracks (V, T, N_cub, 2) in pixel space per view, or None on failure."""
+    gs_views = simulator.gs_context['gs_views']
+    V = len(gs_views)
+    N_cub = simulator.cubature_points.shape[0]
+
+    cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device)
+
+    all_tracks = []
+    for view_idx in range(V):
+        camera = gs_views[view_idx]
+        frames = []
+        for i in range(n_frames):
+            img_path = os.path.join(dataset_dir, data_name, 'data', f'm_{view_idx}_{i}.png')
+            if not os.path.exists(img_path):
+                print(f"[Tracking] Missing {img_path}, skipping CoTracker.")
+                return None
+            frames.append(torch.tensor(np.array(Image.open(img_path).convert('RGB'))).permute(2, 0, 1).float())
+        video = torch.stack(frames).unsqueeze(0).to(device)  # (1, T, 3, H, W)
+
+        with torch.no_grad():
+            proj_2d = _project_to_2d(simulator.cubature_points, camera)  # (N_cub, 2)
+            queries = torch.zeros(1, N_cub, 3, device=device)
+            queries[0, :, 0] = 0
+            queries[0, :, 1:] = proj_2d
+            pred_tracks, _ = cotracker(video, queries=queries)  # (1, T, N_cub, 2)
+        all_tracks.append(pred_tracks[0].cpu().numpy())  # (T, N_cub, 2)
+
+    tracks = np.stack(all_tracks, axis=0)  # (V, T, N_cub, 2)
+    print(f"[Tracking] CoTracker done: {V} views, tracks shape={tracks.shape}")
+    del cotracker
+    torch.cuda.empty_cache()
+    return tracks
+
+
+def _triangulate_tracks(tracks, cameras):
+    """Triangulate multiview 2D tracks to 3D using DLT (vectorized SVD).
+    Args:
+        tracks:  (V, T, N_cub, 2) pixel coords per view
+        cameras: list of V Camera objects
+    Returns:
+        (T, N_cub, 3) triangulated 3D positions in norm_scale world space
+    """
+    V, T, N_cub, _ = tracks.shape
+
+    # Projection matrices in standard column-vector convention: P = full_proj_transform.T
+    # full_proj_transform is already built from the axis-flipped c2w (readCamerasFromTransforms
+    # applies c2w[:3, 1:3] *= -1), so using it directly is correct.
+    Ps = [cam.full_proj_transform.cpu().numpy().T for cam in cameras]
+    Ws = [cam.image_width  for cam in cameras]
+    Hs = [cam.image_height for cam in cameras]
+
+    # Build A: (T, N_cub, 2V, 4)
+    A = np.zeros((T, N_cub, 2 * V, 4), dtype=np.float64)
+    for v, (P, W, H) in enumerate(zip(Ps, Ws, Hs)):
+        u  = tracks[v, :, :, 0]           # (T, N_cub)
+        pv = tracks[v, :, :, 1]           # (T, N_cub)
+        x_ndc = 2 * u  / W - 1            # (T, N_cub)
+        y_ndc = 2 * pv / H - 1            # (T, N_cub)
+        A[:, :, 2*v,   :] = x_ndc[:, :, None] * P[3] - P[0]
+        A[:, :, 2*v+1, :] = y_ndc[:, :, None] * P[3] - P[1]
+
+    # Batched SVD: (T*N_cub, 2V, 4) -> last right singular vector per point
+    A_flat = A.reshape(T * N_cub, 2 * V, 4)
+    _, _, Vt = np.linalg.svd(A_flat, full_matrices=False)  # Vt: (T*N_cub, 4, 4)
+    X = Vt[:, -1, :]                      # (T*N_cub, 4)
+    pts_3d = (X[:, :3] / X[:, 3:4]).reshape(T, N_cub, 3)
+    return pts_3d.astype(np.float32)
+
+
+def _compute_tracking_metric_3d(save_list_pts, triangulated_3d):
+    """Mean L2 distance in norm_scale units between simulated and triangulated cubature positions."""
+    n_frames = min(len(save_list_pts), triangulated_3d.shape[0])
+    frame_errs = [
+        np.linalg.norm(save_list_pts[t] - triangulated_3d[t], axis=-1).mean()
+        for t in range(n_frames)
+    ]
+    return float(np.mean(frame_errs))
+
 def predict_phys_params(args):
 
     # res = 224
@@ -255,8 +347,15 @@ def joint_optimization(args):
     sim_args.yms = init_params.init_yms
     sim_args.prs = init_params.init_prs 
     simulator = LBSSimulator(sim_args, args.dataset_dir, args.output_dir, args.data_name, optimization=True)
-    simulator.set_material() 
+    simulator.set_material()
     simulator.load_lbs()
+
+    cotracker_tracks = _run_cotracker_multiview(simulator, args.dataset_dir, args.data_name, n_frames=16)
+    if cotracker_tracks is not None:
+        triangulated_3d = _triangulate_tracks(cotracker_tracks, simulator.gs_context['gs_views'])
+        print(f"[Tracking] Triangulated 3D tracks: shape={triangulated_3d.shape}")
+    else:
+        triangulated_3d = None
 
     record = {}
     record['train_list'] = []
@@ -268,18 +367,25 @@ def joint_optimization(args):
     best_psnr = 0
     best_ssim = 0
 
-    for iter in pbar: 
-        
-        simulator.initialize_simulator() # Need to re-initialize every iteration since the lbs parameters are updated 
+    for iter in pbar:
+
+        simulator.initialize_simulator() # Need to re-initialize every iteration since the lbs parameters are updated
         start_step = random.randint(sim_args.simulation_start_step, 11)
         end_step = start_step + 4
 
         if iter % sim_args.optimization_checkpoint_interval == 0: # Validate the model for dynamic reconstruction
-            simulator.simulate_fast_forward(15, simulator.total_view_indices, render=True)  
+            simulator.simulate_fast_forward(15, simulator.total_view_indices, render=True)
             psnr, ssim = simulator.calculate_metrics(simulator.total_view_indices, end_step=16)
-            print(f"[Iter {iter}: PSNR={psnr} SSIM={ssim}")
-            yms_pred, prs_pred = torch.pow(10, simulator.pred_yms_normalized), simulator.pred_prs_normalized 
-            record['test_list'].append({'psnr': psnr.item(), 'ssim': ssim.item(), 'yms': yms_pred.item(), 'prs': prs_pred.item()})
+            yms_pred, prs_pred = torch.pow(10, simulator.pred_yms_normalized), simulator.pred_prs_normalized
+            track_err = None
+            if triangulated_3d is not None:
+                track_err = _compute_tracking_metric_3d(simulator.save_list_pts, triangulated_3d)
+            track_str = f" TrackErr={track_err:.4f}" if track_err is not None else ""
+            print(f"[Iter {iter}]: PSNR={psnr:.4f} SSIM={ssim:.4f}{track_str}  E={yms_pred.item():.2f} ν={prs_pred.item():.4f}")
+            entry = {'psnr': psnr.item(), 'ssim': ssim.item(), 'yms': yms_pred.item(), 'prs': prs_pred.item()}
+            if track_err is not None:
+                entry['track_err'] = track_err
+            record['test_list'].append(entry)
             if psnr > best_psnr and ssim > best_ssim: # Save the best model
                 best_psnr, best_ssim = psnr, ssim
                 record['best_psnr'], record['best_ssim'] = psnr.item(), ssim.item()
@@ -287,7 +393,7 @@ def joint_optimization(args):
                 best_params.prs = min(prs_pred.item(), 0.49)
                 OmegaConf.save(best_params, f'{args.output_dir}/{args.data_name}/best_params.yaml')
                 torch.save(simulator.lbs_model.state_dict(), f'{args.output_dir}/{args.data_name}/models/model_best.pth')
-                torch.save(simulator.jacobian_model.state_dict(), f'{args.output_dir}/{args.data_name}/models/jmodel_best.pth') 
+                torch.save(simulator.jacobian_model.state_dict(), f'{args.output_dir}/{args.data_name}/models/jmodel_best.pth')
             simulator.reset_simulator()
             
         if iter != sim_args.optimization_iters:
@@ -321,21 +427,31 @@ def plot_optimization_record(args):
     ssim_vals = [d['ssim'] for d in test_list]
     yms_vals  = [d['yms']  for d in test_list]
     prs_vals  = [d['prs']  for d in test_list]
+    track_vals = [d['track_err'] for d in test_list if 'track_err' in d]
+    has_tracking = len(track_vals) == len(test_list)
 
     best_psnr = record.get('best_psnr', max(psnr_vals))
     best_ssim = record.get('best_ssim', max(ssim_vals))
     best_idx  = next((i for i, d in enumerate(test_list)
                       if d['psnr'] == best_psnr and d['ssim'] == best_ssim), None)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    if has_tracking:
+        fig, axes = plt.subplots(2, 3, figsize=(18, 8))
+        plot_series = [psnr_vals, ssim_vals, track_vals, yms_vals, prs_vals]
+        plot_labels = ['PSNR (dB)', 'SSIM', 'Tracking Error (L2)', "Young's Modulus E (Pa)", 'Poisson Ratio ν']
+        plot_colors = ['steelblue', 'darkorange', 'firebrick', 'forestgreen', 'mediumpurple']
+        ax_list = list(axes.flat)
+        ax_list[-1].set_visible(False)  # hide unused 6th cell
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        plot_series = [psnr_vals, ssim_vals, yms_vals, prs_vals]
+        plot_labels = ['PSNR (dB)', 'SSIM', "Young's Modulus E (Pa)", 'Poisson Ratio ν']
+        plot_colors = ['steelblue', 'darkorange', 'forestgreen', 'mediumpurple']
+        ax_list = list(axes.flat)
+
     fig.suptitle(f'Optimization Record — {args.data_name}', fontsize=14)
 
-    for ax, vals, label, color in zip(
-        axes.flat,
-        [psnr_vals, ssim_vals, yms_vals, prs_vals],
-        ['PSNR (dB)', 'SSIM', "Young's Modulus E (Pa)", 'Poisson Ratio ν'],
-        ['steelblue', 'darkorange', 'forestgreen', 'mediumpurple']
-    ):
+    for ax, vals, label, color in zip(ax_list, plot_series, plot_labels, plot_colors):
         ax.plot(test_iters, vals, color=color, linewidth=2)
         if best_idx is not None:
             ax.axvline(test_iters[best_idx], color='red', linestyle='--', linewidth=1.2, label=f'Best (iter {test_iters[best_idx]})')
@@ -382,6 +498,74 @@ def save_overlay_gif(args):
     print(f"Saved overlay GIF → {out_dir}/overlay.gif")
 
 
+def _save_tracking_gif_impl(args, save_list_pts, cotracker_tracks, camera, out_path,
+                            n_frames=16, dot_radius=3, track_err=None):
+    """Implementation: draw tracking dots on front-view frames and save GIF."""
+    if cotracker_tracks is None or len(save_list_pts) == 0:
+        return
+    from PIL import ImageDraw, ImageFont
+
+    frames_out = []
+    T = min(n_frames, len(save_list_pts), cotracker_tracks.shape[1])
+    gt_dir = os.path.join(args.dataset_dir, args.data_name, 'data')
+
+    W, H = camera.image_width, camera.image_height
+    legend_h = 36
+    pad = 6
+
+    for t in range(T):
+        img_path = os.path.join(gt_dir, f'm_0_{t}.png')
+        if not os.path.exists(img_path):
+            continue
+        img = Image.open(img_path).convert('RGB').copy()
+        draw = ImageDraw.Draw(img)
+
+        # Green dots: GT cubature points (CoTracker 2D tracks on view 0)
+        gt_pts = cotracker_tracks[0, t]  # (N_cub, 2) pixel coords
+        for (x, y) in gt_pts[::4]:
+            x, y = float(x), float(y)
+            draw.ellipse([x - dot_radius, y - dot_radius,
+                          x + dot_radius, y + dot_radius], fill=(0, 220, 0))
+
+        # Red dots: simulated cubature points (projected Vid2Sim positions)
+        sim_pts = torch.tensor(save_list_pts[t], device=device)
+        proj = _project_to_2d(sim_pts, camera).cpu().numpy()
+        for (x, y) in proj[::4]:
+            x, y = float(x), float(y)
+            draw.ellipse([x - dot_radius, y - dot_radius,
+                          x + dot_radius, y + dot_radius], fill=(220, 0, 0))
+
+        # Legend bar at bottom
+        canvas = Image.new('RGB', (W, H + legend_h), (30, 30, 30))
+        canvas.paste(img, (0, 0))
+        ldraw = ImageDraw.Draw(canvas)
+
+        try:
+            font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 13)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Green swatch + label
+        ldraw.rectangle([pad, H + pad, pad + 14, H + pad + 14], fill=(0, 220, 0))
+        ldraw.text((pad + 18, H + pad), 'GT Cubature Points (CoTracker)', fill=(255, 255, 255), font=font)
+
+        # Red swatch + label
+        mid = W // 2
+        ldraw.rectangle([mid, H + pad, mid + 14, H + pad + 14], fill=(220, 0, 0))
+        ldraw.text((mid + 18, H + pad), 'Simulated Cubature Points', fill=(255, 255, 255), font=font)
+
+        # Tracking error (shown on last frame or all frames)
+        if track_err is not None:
+            err_str = f'TrackErr={track_err:.4f}'
+            ldraw.text((pad, H + legend_h // 2 + 2), err_str, fill=(255, 220, 50), font=font)
+
+        frames_out.append(np.array(canvas))
+
+    if frames_out:
+        imageio.mimsave(out_path, frames_out, fps=8, loop=0)
+        print(f"Saved tracking GIF → {out_path}")
+
+
 def final_simulation(args):
 
     print(f"[[Stage II]] Final simulation for {args.data_name}")
@@ -397,11 +581,21 @@ def final_simulation(args):
     simulator.load_lbs()
     simulator.initialize_simulator()
 
+    cotracker_tracks = _run_cotracker_multiview(simulator, args.dataset_dir, args.data_name, n_frames=16)
+    if cotracker_tracks is not None:
+        triangulated_3d = _triangulate_tracks(cotracker_tracks, simulator.gs_context['gs_views'])
+    else:
+        triangulated_3d = None
+
     # For future state prediction, you can increase the target step
     simulator.simulate_fast_forward(target_step=15, view_indices=simulator.total_view_indices, render=True)
     simulator.save_images(simulator.tag)
     psnr, ssim = simulator.calculate_metrics(view_indices=simulator.total_view_indices, end_step=16)
-    print(f"After joint optimization -- PSNR: {psnr.item()}, SSIM: {ssim.item()}")
+    track_err = None
+    if triangulated_3d is not None:
+        track_err = _compute_tracking_metric_3d(simulator.save_list_pts, triangulated_3d)
+    track_str = f", TrackErr={track_err:.4f}" if track_err is not None else ""
+    print(f"After joint optimization -- PSNR: {psnr.item():.4f}, SSIM: {ssim.item():.4f}{track_str}")
 
     # Load best iter from optimization record
     best_iter = '?'
@@ -435,6 +629,11 @@ def final_simulation(args):
 
     plot_optimization_record(args)
     save_overlay_gif(args)
+    if cotracker_tracks is not None:
+        track_gif_path = f'{args.output_dir}/{args.data_name}/tracking_overlay.gif'
+        _save_tracking_gif_impl(args, simulator.save_list_pts, cotracker_tracks,
+                                simulator.gs_context['gs_views'][0], track_gif_path,
+                                track_err=track_err)
 
 def run_recon(args):
 
