@@ -498,9 +498,66 @@ def save_overlay_gif(args):
     print(f"Saved overlay GIF → {out_dir}/overlay.gif")
 
 
+def _save_tracking_3d_gif(save_list_pts, triangulated_3d, floor_level, out_path,
+                          dataset_dir=None, data_name=None, n_frames=16, track_err=None):
+    """Render RGB video + GT/simulated cubature points as a 2-panel 3D scatter animation."""
+    if triangulated_3d is None or len(save_list_pts) == 0:
+        return
+    T = min(n_frames, len(save_list_pts), triangulated_3d.shape[0])
+
+    all_sim = np.concatenate(save_list_pts[:T], axis=0)
+    all_gt  = triangulated_3d[:T].reshape(-1, 3)
+    all_pts = np.concatenate([all_sim, all_gt], axis=0)
+    pad = 0.15
+    xlim = (all_pts[:, 0].min() - pad, all_pts[:, 0].max() + pad)
+    ylim = (all_pts[:, 1].min() - pad, all_pts[:, 1].max() + pad)
+    zlim = (min(all_pts[:, 2].min() - pad, floor_level - pad), all_pts[:, 2].max() + pad)
+
+    frames = []
+
+    for t in range(T):
+        sim_pts = save_list_pts[t]
+        gt_pts  = triangulated_3d[t]
+
+        fig = plt.figure(figsize=(5, 5), dpi=100)
+        fig.patch.set_facecolor('white')
+        ax3d = fig.add_subplot(1, 1, 1, projection='3d')
+        ax3d.set_facecolor('#f5f5f5')
+        ax3d.scatter(gt_pts[:, 0],  gt_pts[:, 1],  gt_pts[:, 2],
+                     c='green', s=4, alpha=0.7, label='GT (CoTracker)')
+        ax3d.scatter(sim_pts[:, 0], sim_pts[:, 1], sim_pts[:, 2],
+                     c='red',   s=4, alpha=0.7, label='Simulated')
+
+        xs = np.linspace(xlim[0], xlim[1], 4)
+        ys = np.linspace(ylim[0], ylim[1], 4)
+        xx, yy = np.meshgrid(xs, ys)
+        ax3d.plot_surface(xx, yy, np.full_like(xx, floor_level),
+                          alpha=0.2, color='saddlebrown')
+        ax3d.set_xlim(xlim); ax3d.set_ylim(ylim); ax3d.set_zlim(zlim)
+        ax3d.set_xlabel('X', fontsize=7); ax3d.set_ylabel('Y', fontsize=7); ax3d.set_zlabel('Z', fontsize=7)
+        ax3d.tick_params(labelsize=6)
+        ax3d.view_init(elev=20, azim=45)
+        title_3d = 'Cubature Points (3D)'
+        if track_err is not None:
+            title_3d += f'  |  TrackErr={track_err:.4f}'
+        ax3d.set_title(title_3d, fontsize=9)
+        ax3d.legend(loc='upper right', fontsize=7, markerscale=2)
+
+        fig.tight_layout(pad=0.3)
+        fig.canvas.draw()
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        w, h = fig.canvas.get_width_height()
+        frames.append(buf.reshape(h, w, 4)[:, :, :3])
+        plt.close(fig)
+
+    if frames:
+        imageio.mimsave(out_path, frames, fps=8, loop=0)
+        print(f"Saved tracking 3D GIF → {out_path}")
+
+
 def _save_tracking_gif_impl(args, save_list_pts, cotracker_tracks, camera, out_path,
-                            n_frames=16, dot_radius=3, track_err=None):
-    """Implementation: draw tracking dots on front-view frames and save GIF."""
+                            n_frames=16, dot_radius=2, track_err=None, view_idx=0):
+    """Implementation: draw tracking dots on frames and save GIF."""
     if cotracker_tracks is None or len(save_list_pts) == 0:
         return
     from PIL import ImageDraw, ImageFont
@@ -508,56 +565,70 @@ def _save_tracking_gif_impl(args, save_list_pts, cotracker_tracks, camera, out_p
     frames_out = []
     T = min(n_frames, len(save_list_pts), cotracker_tracks.shape[1])
     gt_dir = os.path.join(args.dataset_dir, args.data_name, 'data')
+    sim_dir = os.path.join(args.output_dir, args.data_name, 'render_best')
 
     W, H = camera.image_width, camera.image_height
     legend_h = 36
     pad = 6
 
+    try:
+        font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 13)
+    except Exception:
+        font = ImageFont.load_default()
+
+    # Pre-compute projected sim points per frame
+    sim_proj_per_frame = []
     for t in range(T):
-        img_path = os.path.join(gt_dir, f'm_0_{t}.png')
-        if not os.path.exists(img_path):
-            continue
-        img = Image.open(img_path).convert('RGB').copy()
-        draw = ImageDraw.Draw(img)
-
-        # Green dots: GT cubature points (CoTracker 2D tracks on view 0)
-        gt_pts = cotracker_tracks[0, t]  # (N_cub, 2) pixel coords
-        for (x, y) in gt_pts[::4]:
-            x, y = float(x), float(y)
-            draw.ellipse([x - dot_radius, y - dot_radius,
-                          x + dot_radius, y + dot_radius], fill=(0, 220, 0))
-
-        # Red dots: simulated cubature points (projected Vid2Sim positions)
         sim_pts = torch.tensor(save_list_pts[t], device=device)
-        proj = _project_to_2d(sim_pts, camera).cpu().numpy()
-        for (x, y) in proj[::4]:
-            x, y = float(x), float(y)
-            draw.ellipse([x - dot_radius, y - dot_radius,
-                          x + dot_radius, y + dot_radius], fill=(220, 0, 0))
+        sim_proj_per_frame.append(_project_to_2d(sim_pts, camera).cpu().numpy())
 
-        # Legend bar at bottom
-        canvas = Image.new('RGB', (W, H + legend_h), (30, 30, 30))
-        canvas.paste(img, (0, 0))
+    def _draw_dots(img, gt_pts, sim_proj):
+        draw = ImageDraw.Draw(img)
+        for (x, y) in gt_pts:
+            x, y = float(x), float(y)
+            if np.isfinite(x) and np.isfinite(y):
+                draw.ellipse([x-dot_radius, y-dot_radius, x+dot_radius, y+dot_radius], fill=(0, 220, 0))
+        for (x, y) in sim_proj:
+            x, y = float(x), float(y)
+            if np.isfinite(x) and np.isfinite(y):
+                draw.ellipse([x-dot_radius, y-dot_radius, x+dot_radius, y+dot_radius], fill=(220, 0, 0))
+        return img
+
+    for t in range(T):
+        gt_img_path  = os.path.join(gt_dir,  f'm_{view_idx}_{t}.png')
+        sim_img_path = os.path.join(sim_dir, f'r_{view_idx}_{t}.png')
+        if not os.path.exists(gt_img_path):
+            continue
+
+        gt_img  = Image.open(gt_img_path).convert('RGB').copy()
+        sim_img = Image.open(sim_img_path).convert('RGB').copy() if os.path.exists(sim_img_path) else Image.new('RGB', (W, H), (200, 200, 200))
+
+        gt_pts   = cotracker_tracks[view_idx, t]
+        sim_proj = sim_proj_per_frame[t]
+
+        gt_img  = _draw_dots(gt_img,  gt_pts, sim_proj)
+        sim_img = _draw_dots(sim_img, gt_pts, sim_proj)
+
+        # Stitch side by side with legend bar
+        canvas = Image.new('RGB', (W * 2, H + legend_h), (30, 30, 30))
+        canvas.paste(gt_img,  (0, 0))
+        canvas.paste(sim_img, (W, 0))
         ldraw = ImageDraw.Draw(canvas)
 
-        try:
-            font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 13)
-        except Exception:
-            font = ImageFont.load_default()
+        # Column labels
+        ldraw.text((pad, H + pad), 'GT Video', fill=(200, 200, 200), font=font)
+        ldraw.text((W + pad, H + pad), 'Simulated', fill=(200, 200, 200), font=font)
 
-        # Green swatch + label
-        ldraw.rectangle([pad, H + pad, pad + 14, H + pad + 14], fill=(0, 220, 0))
-        ldraw.text((pad + 18, H + pad), 'GT Cubature Points (CoTracker)', fill=(255, 255, 255), font=font)
+        # Legend swatches
+        legend_x = W // 2 - 100
+        ldraw.rectangle([legend_x, H + pad, legend_x + 14, H + pad + 14], fill=(0, 220, 0))
+        ldraw.text((legend_x + 18, H + pad), 'GT (CoTracker)', fill=(255, 255, 255), font=font)
+        legend_x2 = legend_x + 160
+        ldraw.rectangle([legend_x2, H + pad, legend_x2 + 14, H + pad + 14], fill=(220, 0, 0))
+        ldraw.text((legend_x2 + 18, H + pad), 'Simulated', fill=(255, 255, 255), font=font)
 
-        # Red swatch + label
-        mid = W // 2
-        ldraw.rectangle([mid, H + pad, mid + 14, H + pad + 14], fill=(220, 0, 0))
-        ldraw.text((mid + 18, H + pad), 'Simulated Cubature Points', fill=(255, 255, 255), font=font)
-
-        # Tracking error (shown on last frame or all frames)
         if track_err is not None:
-            err_str = f'TrackErr={track_err:.4f}'
-            ldraw.text((pad, H + legend_h // 2 + 2), err_str, fill=(255, 220, 50), font=font)
+            ldraw.text((W + pad, H + legend_h // 2 + 2), f'TrackErr={track_err:.4f}', fill=(255, 220, 50), font=font)
 
         frames_out.append(np.array(canvas))
 
@@ -630,10 +701,18 @@ def final_simulation(args):
     plot_optimization_record(args)
     save_overlay_gif(args)
     if cotracker_tracks is not None:
-        track_gif_path = f'{args.output_dir}/{args.data_name}/tracking_overlay.gif'
-        _save_tracking_gif_impl(args, simulator.save_list_pts, cotracker_tracks,
-                                simulator.gs_context['gs_views'][0], track_gif_path,
-                                track_err=track_err)
+        gs_views = simulator.gs_context['gs_views']
+        for view_idx, camera in enumerate(gs_views):
+            suffix = '' if view_idx == 0 else f'_v{view_idx}'
+            track_gif_path = f'{args.output_dir}/{args.data_name}/tracking_overlay{suffix}.gif'
+            _save_tracking_gif_impl(args, simulator.save_list_pts, cotracker_tracks,
+                                    camera, track_gif_path, track_err=track_err,
+                                    view_idx=view_idx)
+        track_3d_path = f'{args.output_dir}/{args.data_name}/tracking_3d.gif'
+        _save_tracking_3d_gif(simulator.save_list_pts, triangulated_3d,
+                              simulator.floor_level, track_3d_path,
+                              dataset_dir=args.dataset_dir, data_name=args.data_name,
+                              track_err=track_err)
 
 def run_recon(args):
 
