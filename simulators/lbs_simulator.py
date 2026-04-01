@@ -45,6 +45,7 @@ class LBSSimulator():
         self.refine_jacobian_batch_size = args.refine_jacobian_batch_size
         self.refine_jacobian_samples = args.refine_jacobian_samples  
         self.simulation_newton_iters = args.simulation_newton_iters
+        self.gravity_magnitude = getattr(args, 'gravity', 7.5)
 
         if args.model_type == 'gs':
             gaussians, gs_context = load_gaussians(dataset_dir, output_dir, data_name, self.tag)
@@ -109,7 +110,8 @@ class LBSSimulator():
             print(f'[Simulation] Material Parameters: E={self.yms} ν={self.prs}')
              
         self.grav = torch.zeros(3, device=self.device)
-        self.grav[self.floor_axis] = 7.5
+        self.grav[self.floor_axis] = self.gravity_magnitude
+        print(f'[Simulation] Gravity: {self.gravity_magnitude:.4f} (floor_axis={self.floor_axis})')
     
     def set_lbs(self):
         self.lbs_model_plus_rigid = lambda x: torch.cat((self.lbs_model(x),
