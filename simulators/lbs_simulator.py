@@ -45,7 +45,7 @@ class LBSSimulator():
         self.refine_jacobian_batch_size = args.refine_jacobian_batch_size
         self.refine_jacobian_samples = args.refine_jacobian_samples  
         self.simulation_newton_iters = args.simulation_newton_iters
-        self.gravity_magnitude = getattr(args, 'gravity', 7.5)
+        self.gravity_magnitude = 7.5
 
         if args.model_type == 'gs':
             gaussians, gs_context = load_gaussians(dataset_dir, output_dir, data_name, self.tag)
