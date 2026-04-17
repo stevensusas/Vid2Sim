@@ -357,13 +357,8 @@ class LBSSimulator():
             self.gaussians.covariance_activation = build_cov
             renderings, rendering_bg = render_gs(self.gaussians, views, self.gs_context['gs_pipeline'],
                 self.gs_context['gs_background'], self.dataset_dir, self.data_name)
-            rendered = torch.stack(renderings, dim=0)
-            rendered_bg = torch.stack(rendering_bg, dim=0)
-            if not torch.is_grad_enabled():
-                rendered = rendered.cpu()
-                rendered_bg = rendered_bg.cpu()
-            self.save_list.append(rendered)
-            self.save_list_bg.append(rendered_bg)
+            self.save_list.append(torch.stack(renderings, dim=0))
+            self.save_list_bg.append(torch.stack(rendering_bg, dim=0))
             if step == 0:
                 x_cubature = self.cubature_points
             else:
@@ -489,24 +484,22 @@ class LBSSimulator():
         print(f'Saved point cloud GIF to {out_path}')
 
     def calculate_loss(self, view_indices=None, start_step=0, end_step=-1):
-        images_gt = self.ref[view_indices.cpu(), start_step:end_step].to(self.device)
+        images_gt = self.ref[view_indices, start_step:end_step]
         images_pred = torch.stack(self.save_list, dim=1)
         images_pred_loss = images_pred.reshape(-1, 3, images_pred.shape[-2], images_pred.shape[-1])
         images_gt_loss = images_gt.reshape(-1, 3, images_gt.shape[-2], images_gt.shape[-1])
         loss = self.loss_fn(images_pred_loss, images_gt_loss)
         return loss
-    
+
     def calculate_metrics(self, view_indices=None, start_step=0, end_step=-1):
-        images_gt = self.ref[view_indices.cpu(), start_step:end_step]
+        images_gt = self.ref[view_indices, start_step:end_step]
         images_pred = torch.stack(self.save_list, dim=1)
-        gt_flat = images_gt.reshape(-1, *images_gt.shape[2:])
-        pred_flat = images_pred.reshape(-1, *images_pred.shape[2:])
+        images_pred_loss = images_pred.reshape(-1, 3, images_pred.shape[-2], images_pred.shape[-1]).clamp(0, 1)
+        images_gt_loss = images_gt.reshape(-1, 3, images_gt.shape[-2], images_gt.shape[-1]).clamp(0, 1)
         psnr_list, ssim_list = [], []
-        for i in range(gt_flat.shape[0]):
-            gt_i = gt_flat[i:i+1].to(self.device).clamp(0, 1)
-            pred_i = pred_flat[i:i+1].to(self.device).clamp(0, 1)
-            psnr_list.append(self.psnr(pred_i, gt_i))
-            ssim_list.append(self.ssim(pred_i, gt_i))
+        for i in range(images_pred_loss.shape[0]):
+            psnr_list.append(self.psnr(images_pred_loss[i:i+1], images_gt_loss[i:i+1]))
+            ssim_list.append(self.ssim(images_pred_loss[i:i+1], images_gt_loss[i:i+1]))
         psnr, ssim = torch.stack(psnr_list, dim=0).mean(), torch.stack(ssim_list, dim=0).mean()
         return psnr, ssim
     

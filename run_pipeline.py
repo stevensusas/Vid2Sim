@@ -63,7 +63,6 @@ def _project_to_2d(pts_3d, camera):
 def _run_cotracker_multiview(simulator, dataset_dir, data_name, n_frames=16):
     """Run CoTracker on all views using projected cubature points as queries.
     Returns tracks (V, T, N_cub, 2) in pixel space per view, or None on failure."""
-    n_frames = min(n_frames, 16)  # cap to avoid GPU OOM
     gs_views = simulator.gs_context['gs_views']
     V = len(gs_views)
     N_cub = simulator.cubature_points.shape[0]
@@ -371,12 +370,11 @@ def joint_optimization(args):
     for iter in pbar:
 
         simulator.initialize_simulator() # Need to re-initialize every iteration since the lbs parameters are updated
-        n_total = simulator.n_sim_frames
-        max_start = max(sim_args.simulation_start_step, n_total - 5)
-        start_step = random.randint(sim_args.simulation_start_step, max_start)
-        end_step = min(start_step + 4, n_total)
+        start_step = random.randint(sim_args.simulation_start_step, 11)
+        end_step = start_step + 4
 
         if iter % sim_args.optimization_checkpoint_interval == 0: # Validate the model for dynamic reconstruction
+            n_total = simulator.n_sim_frames
             simulator.simulate_fast_forward(n_total - 1, simulator.total_view_indices, render=True)
             psnr, ssim = simulator.calculate_metrics(simulator.total_view_indices, end_step=n_total)
             yms_pred, prs_pred = torch.pow(10, simulator.pred_yms_normalized), simulator.pred_prs_normalized
