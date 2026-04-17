@@ -45,7 +45,16 @@ class LBSSimulator():
         self.refine_jacobian_batch_size = args.refine_jacobian_batch_size
         self.refine_jacobian_samples = args.refine_jacobian_samples  
         self.simulation_newton_iters = args.simulation_newton_iters
-        self.gravity_magnitude = 7.5
+        # Gravity normalized by object mass relative to double_stretch_zebra (reference).
+        # PhysTwin writes n_nodes (= total structure points, each with mass 1) to sim_config.yaml.
+        G_BASE = 7.5  # tuned for double_stretch_zebra
+        import yaml
+        n_nodes = args.n_nodes
+        ref_sim_config_path = os.path.join(dataset_dir, 'double_stretch_zebra', 'sim_config.yaml')
+        with open(ref_sim_config_path, 'r') as f:
+            ref_cfg = yaml.safe_load(f)
+        n_nodes_ref = ref_cfg['n_nodes']
+        self.gravity_magnitude = G_BASE * n_nodes / n_nodes_ref
 
         if args.model_type == 'gs':
             gaussians, gs_context = load_gaussians(dataset_dir, output_dir, data_name, self.tag)
@@ -55,10 +64,17 @@ class LBSSimulator():
         else:
             raise ValueError(f'Unknown model type: {args.model_type}')
         
+        # Determine simulation frame count: use hand trajectory length if present, else default 24.
+        hand_traj_path = os.path.join(dataset_dir, data_name, 'hand_trajectory.npy')
+        if os.path.exists(hand_traj_path):
+            self.n_sim_frames = np.load(hand_traj_path, mmap_mode='r').shape[0]
+        else:
+            self.n_sim_frames = 24
+
         if args.model_type == 'gs':
             self.points = gaussians.get_xyz.clone().detach().to(device)
             self.total_view_indices = torch.arange(0, len(gs_context['gs_views']), 1)
-            self.ref = load_gts(dataset_dir, data_name, args.view_samples, 24) 
+            self.ref = load_gts(dataset_dir, data_name, args.view_samples, self.n_sim_frames)
         elif args.model_type == 'mesh':
             self.points, mesh = load_points_from_mesh(mesh_path)
             self.total_view_indices = torch.arange(0, 1, 1) 
@@ -239,11 +255,11 @@ class LBSSimulator():
             
             self.bigI = torch.tile(torch.eye(3, device=self.device).flatten().unsqueeze(dim=1), (self.num_cubature_points, 1))
  
-        self.material_object = NeohookeanMaterial(self.cubature_point_wise_yms, self.cubature_point_wise_prs) 
+        self.material_object = NeohookeanMaterial(self.cubature_point_wise_yms, self.cubature_point_wise_prs)
         self.gravity_object = physics.utils.Gravity(rhos=self.cubature_point_wise_rho, acceleration=self.grav)
         self.floor_object = physics.utils.Floor(floor_height=self.floor_level, floor_axis=self.floor_axis, flip_floor=self.flip_floor)
         self.integration_sampling = torch.as_tensor(self.particle_volume / self.num_cubature_points,
-            device=self.device, dtype=torch.float32) 
+            device=self.device, dtype=torch.float32)
 
         self.partial_floor_e = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_scene_energy(self.floor_object,
             self.B, coeff=self.penalty_weight, integration_sampling=None)
@@ -251,7 +267,7 @@ class LBSSimulator():
             self.B, coeff=1, integration_sampling=self.integration_sampling)
         self.partial_material_e = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_material_energy(self.material_object,
             self.dFdz, coeff=1, integration_sampling=self.integration_sampling)
-    
+
         self.partial_floor_g = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_scene_gradient(self.floor_object,
             self.B, coeff=self.penalty_weight, integration_sampling=None)
         self.partial_grav_g = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_scene_gradient(self.gravity_object,
@@ -265,17 +281,63 @@ class LBSSimulator():
             self.B, coeff=1, integration_sampling=self.integration_sampling)
         self.partial_material_h = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_material_hessian(self.material_object,
             self.dFdz, coeff=1, integration_sampling=self.integration_sampling)
-        
+
+        # --- Hand trajectory boundary constraints ---
+        # Load hand_trajectory.npy if present in the dataset dir.
+        # Shape: (T, N_ctrl, 3) in Vid2Sim normalized coords (same space as cubature_points).
+        self.hand_trajectory = None
+        self.boundary_object = None
+        hand_traj_path = os.path.join(self.dataset_dir, self.data_name, 'hand_trajectory.npy')
+        if os.path.exists(hand_traj_path):
+            hand_traj = np.load(hand_traj_path).copy()  # (T, N_ctrl, 3)
+            # Mirror floor axis: PhysTwin has UP=-Z, Vid2Sim has UP=+Z (see
+            # PhysTwin/generate_vid2sim_data.py comment at floor_level_normalized).
+            # sim_config.yaml already negates floor_level; the hand trajectory needs
+            # the same mirror to live in Vid2Sim world space alongside the Gaussians.
+            hand_traj[..., self.floor_axis] *= -1
+            self.hand_trajectory = torch.tensor(hand_traj, dtype=torch.float32, device=self.device)
+            # Find nearest cubature point for each hand point (at frame 0)
+            cub_np = self.cubature_points.detach().cpu().numpy()
+            hand0_np = hand_traj[0]  # (N_ctrl, 3)
+            from scipy.spatial import cKDTree
+            tree = cKDTree(cub_np)
+            _, nn_idx = tree.query(hand0_np, k=1)  # (N_ctrl,)
+            self.hand_constraint_indices = torch.tensor(nn_idx, dtype=torch.long, device=self.device)
+            # Build Boundary object and initialize with frame-0 positions
+            self.boundary_object = physics.utils.Boundary()
+            self.boundary_object.set_pinned_verts(
+                idx=self.hand_constraint_indices,
+                pos=self.hand_trajectory[0],
+            )
+            self.partial_boundary_e = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_scene_energy(
+                self.boundary_object, self.B, coeff=5000.0, integration_sampling=None)
+            self.partial_boundary_g = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_scene_gradient(
+                self.boundary_object, self.B, coeff=5000.0, integration_sampling=None)
+            self.partial_boundary_h = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_scene_hessian(
+                self.boundary_object, self.B, coeff=5000.0, integration_sampling=None)
+            print(f'[Simulation] Hand trajectory loaded: {hand_traj.shape}, '
+                  f'N_ctrl={hand_traj.shape[1]}, T={hand_traj.shape[0]}')
+        else:
+            print(f'[Simulation] No hand_trajectory.npy found at {hand_traj_path} — gravity-only simulation')
+
+        pt_wise_e = [self.partial_grav_e, self.partial_floor_e]
+        pt_wise_g = [self.partial_grav_g, self.partial_floor_g]
+        pt_wise_h = [self.partial_grav_h, self.partial_floor_h]
+        if self.boundary_object is not None:
+            pt_wise_e.append(self.partial_boundary_e)
+            pt_wise_g.append(self.partial_boundary_g)
+            pt_wise_h.append(self.partial_boundary_h)
+
         self.partial_newton_E = partial(newton_E, B=self.B, BMB=self.BMB, dt=self.delta_t, x0_flat=self.x0_flat,
             dFdz=self.dFdz, bigI=self.bigI, model=self.lbs_model_plus_rigid, defo_grad_energies=[self.partial_material_e],
-            pt_wise_energies=[self.partial_grav_e, self.partial_floor_e])
+            pt_wise_energies=pt_wise_e)
         self.partial_newton_G = partial(newton_G, B=self.B, BMB=self.BMB, dt=self.delta_t, x0_flat=self.x0_flat,
             dFdz=self.dFdz, bigI=self.bigI, model=self.lbs_model_plus_rigid, defo_grad_gradients=[self.partial_material_g],
-            pt_wise_gradients=[self.partial_grav_g, self.partial_floor_g])
+            pt_wise_gradients=pt_wise_g)
         self.partial_newton_H = partial(newton_H, B=self.B, BMB=self.BMB, dt=self.delta_t, x0_flat=self.x0_flat,
             dFdz=self.dFdz, bigI=self.bigI, model=self.lbs_model_plus_rigid, defo_grad_hessians=[self.partial_material_h],
-            pt_wise_hessians=[self.partial_grav_h, self.partial_floor_h]) 
-            
+            pt_wise_hessians=pt_wise_h)
+
         self.reset_simulator()
 
     def render_frame(self, step, views):
@@ -295,8 +357,13 @@ class LBSSimulator():
             self.gaussians.covariance_activation = build_cov
             renderings, rendering_bg = render_gs(self.gaussians, views, self.gs_context['gs_pipeline'],
                 self.gs_context['gs_background'], self.dataset_dir, self.data_name)
-            self.save_list.append(torch.stack(renderings, dim=0))
-            self.save_list_bg.append(torch.stack(rendering_bg, dim=0))
+            rendered = torch.stack(renderings, dim=0)
+            rendered_bg = torch.stack(rendering_bg, dim=0)
+            if not torch.is_grad_enabled():
+                rendered = rendered.cpu()
+                rendered_bg = rendered_bg.cpu()
+            self.save_list.append(rendered)
+            self.save_list_bg.append(rendered_bg)
             if step == 0:
                 x_cubature = self.cubature_points
             else:
@@ -422,31 +489,38 @@ class LBSSimulator():
         print(f'Saved point cloud GIF to {out_path}')
 
     def calculate_loss(self, view_indices=None, start_step=0, end_step=-1):
-        images_gt = self.ref[view_indices, start_step:end_step]
+        images_gt = self.ref[view_indices.cpu(), start_step:end_step].to(self.device)
         images_pred = torch.stack(self.save_list, dim=1)
         images_pred_loss = images_pred.reshape(-1, 3, images_pred.shape[-2], images_pred.shape[-1])
         images_gt_loss = images_gt.reshape(-1, 3, images_gt.shape[-2], images_gt.shape[-1])
         loss = self.loss_fn(images_pred_loss, images_gt_loss)
         return loss
     
-    def calculate_metrics(self, view_indices=None, start_step=0, end_step=-1): 
-        images_gt = self.ref[view_indices, start_step:end_step]
-        images_pred = torch.stack(self.save_list, dim=1) 
-        images_pred_loss = images_pred.reshape(-1, 3, images_pred.shape[-2], images_pred.shape[-1]).clamp(0, 1)
-        images_gt_loss = images_gt.reshape(-1, 3, images_gt.shape[-2], images_gt.shape[-1]).clamp(0, 1)
+    def calculate_metrics(self, view_indices=None, start_step=0, end_step=-1):
+        images_gt = self.ref[view_indices.cpu(), start_step:end_step]
+        images_pred = torch.stack(self.save_list, dim=1)
+        gt_flat = images_gt.reshape(-1, *images_gt.shape[2:])
+        pred_flat = images_pred.reshape(-1, *images_pred.shape[2:])
         psnr_list, ssim_list = [], []
-        for i in range(images_pred_loss.shape[0]):
-            psnr_list.append(self.psnr(images_pred_loss[i:i+1], images_gt_loss[i:i+1]))
-            ssim_list.append(self.ssim(images_pred_loss[i:i+1], images_gt_loss[i:i+1]))
+        for i in range(gt_flat.shape[0]):
+            gt_i = gt_flat[i:i+1].to(self.device).clamp(0, 1)
+            pred_i = pred_flat[i:i+1].to(self.device).clamp(0, 1)
+            psnr_list.append(self.psnr(pred_i, gt_i))
+            ssim_list.append(self.ssim(pred_i, gt_i))
         psnr, ssim = torch.stack(psnr_list, dim=0).mean(), torch.stack(ssim_list, dim=0).mean()
         return psnr, ssim
     
     def simulate_step(self):
         self.z_prev = self.z.clone()
         self.z_dot_prev = self.z_dot.clone()
+        # Update hand boundary target for this frame
+        if self.boundary_object is not None and self.hand_trajectory is not None:
+            T = self.hand_trajectory.shape[0]
+            frame_idx = min(self.current_step, T - 1)
+            self.boundary_object.update_pinned(self.hand_trajectory[frame_idx])
         more_partial_newton_E = partial(self.partial_newton_E, z_prev=self.z_prev, z_dot=self.z_dot)
         more_partial_newton_G = partial(self.partial_newton_G, z_prev=self.z_prev, z_dot=self.z_dot)
-        more_partial_newton_H = partial(self.partial_newton_H, z_prev=self.z_prev, z_dot=self.z_dot) 
+        more_partial_newton_H = partial(self.partial_newton_H, z_prev=self.z_prev, z_dot=self.z_dot)
         self.z = newtons_method(self.z, more_partial_newton_E, more_partial_newton_G,
             more_partial_newton_H, max_iters=self.simulation_newton_iters)
         self.z_dot = ((self.z - self.z_prev) / self.delta_t)
@@ -454,20 +528,20 @@ class LBSSimulator():
     @torch.no_grad()
     def simulate_fast_forward(self, target_step, view_indices=[0], render=False):
         views = [self.gs_context['gs_views'][idx] for idx in view_indices] if self.args.model_type == 'gs' else None
-        for i in range(self.current_step, target_step): 
-            if i == 0 and render: 
-                self.render_frame(i, views) 
-            self.simulate_step()
-            if render: 
-                self.render_frame(i+1, views) 
-        self.current_step = target_step
-
-    def simulate_with_grad(self, target_step, view_indices=[0]): 
-        views = [self.gs_context['gs_views'][idx] for idx in view_indices] 
         for i in range(self.current_step, target_step):
+            if i == 0 and render:
+                self.render_frame(i, views)
+            self.current_step = i + 1
+            self.simulate_step()
+            if render:
+                self.render_frame(i+1, views)
+
+    def simulate_with_grad(self, target_step, view_indices=[0]):
+        views = [self.gs_context['gs_views'][idx] for idx in view_indices]
+        for i in range(self.current_step, target_step):
+            self.current_step = i + 1
             self.simulate_step()
             self.render_frame(i, views)
-        self.current_step = target_step
     
     def update_parameters(self, view_indices, start_step, end_step):
         loss = self.calculate_loss(view_indices, start_step, end_step)

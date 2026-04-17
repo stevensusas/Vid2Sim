@@ -12,3 +12,6 @@ ckpt_lbs_template.pth
 checkpoints
 outputs
 dataset
+
+outputs_fall/
+outputs_interaction/

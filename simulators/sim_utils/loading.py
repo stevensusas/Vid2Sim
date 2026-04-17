@@ -74,5 +74,7 @@ def load_gts(dataset_dir, data_name, view_num=12, frame_num=24):
         for j in range(frame_num):
             images.append(pil_to_tensor(Image.open(f'{base_path}/m_{i}_{j}.png')).float()[:3])
     width, height = images[0].shape[-2:]
-    images = torch.stack(images).reshape(view_num, frame_num, 3, width, height).to(device) / 255.   
+    images = torch.stack(images).reshape(view_num, frame_num, 3, width, height) / 255.
+    if frame_num <= 24:
+        images = images.to(device)
     return images

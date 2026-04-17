@@ -63,6 +63,7 @@ def _project_to_2d(pts_3d, camera):
 def _run_cotracker_multiview(simulator, dataset_dir, data_name, n_frames=16):
     """Run CoTracker on all views using projected cubature points as queries.
     Returns tracks (V, T, N_cub, 2) in pixel space per view, or None on failure."""
+    n_frames = min(n_frames, 16)  # cap to avoid GPU OOM
     gs_views = simulator.gs_context['gs_views']
     V = len(gs_views)
     N_cub = simulator.cubature_points.shape[0]
@@ -350,7 +351,7 @@ def joint_optimization(args):
     simulator.set_material()
     simulator.load_lbs()
 
-    cotracker_tracks = _run_cotracker_multiview(simulator, args.dataset_dir, args.data_name, n_frames=16)
+    cotracker_tracks = _run_cotracker_multiview(simulator, args.dataset_dir, args.data_name, n_frames=simulator.n_sim_frames)
     if cotracker_tracks is not None:
         triangulated_3d = _triangulate_tracks(cotracker_tracks, simulator.gs_context['gs_views'])
         print(f"[Tracking] Triangulated 3D tracks: shape={triangulated_3d.shape}")
@@ -370,12 +371,14 @@ def joint_optimization(args):
     for iter in pbar:
 
         simulator.initialize_simulator() # Need to re-initialize every iteration since the lbs parameters are updated
-        start_step = random.randint(sim_args.simulation_start_step, 11)
-        end_step = start_step + 4
+        n_total = simulator.n_sim_frames
+        max_start = max(sim_args.simulation_start_step, n_total - 5)
+        start_step = random.randint(sim_args.simulation_start_step, max_start)
+        end_step = min(start_step + 4, n_total)
 
         if iter % sim_args.optimization_checkpoint_interval == 0: # Validate the model for dynamic reconstruction
-            simulator.simulate_fast_forward(15, simulator.total_view_indices, render=True)
-            psnr, ssim = simulator.calculate_metrics(simulator.total_view_indices, end_step=16)
+            simulator.simulate_fast_forward(n_total - 1, simulator.total_view_indices, render=True)
+            psnr, ssim = simulator.calculate_metrics(simulator.total_view_indices, end_step=n_total)
             yms_pred, prs_pred = torch.pow(10, simulator.pred_yms_normalized), simulator.pred_prs_normalized
             track_err = None
             if triangulated_3d is not None:
@@ -473,7 +476,7 @@ def save_overlay_gif(args):
     out_dir   = f'{args.output_dir}/{args.data_name}'
     gt_dir    = f'{args.dataset_dir}/{args.data_name}/data'
     render_dir = f'{out_dir}/render_best'
-    n_frames  = 16
+    n_frames  = len([f for f in os.listdir(render_dir) if f.startswith('r_0_') and f.endswith('.png')])
 
     gt_frames, rc_frames = [], []
     for i in range(n_frames):
@@ -499,15 +502,22 @@ def save_overlay_gif(args):
 
 
 def _save_tracking_3d_gif(save_list_pts, triangulated_3d, floor_level, out_path,
-                          dataset_dir=None, data_name=None, n_frames=16, track_err=None):
+                          dataset_dir=None, data_name=None, n_frames=None, track_err=None,
+                          hand_trajectory=None):
     """Render RGB video + GT/simulated cubature points as a 2-panel 3D scatter animation."""
-    if triangulated_3d is None or len(save_list_pts) == 0:
+    if len(save_list_pts) == 0:
         return
-    T = min(n_frames, len(save_list_pts), triangulated_3d.shape[0])
+    T = len(save_list_pts) if n_frames is None else min(n_frames, len(save_list_pts))
+    T_gt = triangulated_3d.shape[0] if triangulated_3d is not None else 0
+    T_hand = hand_trajectory.shape[0] if hand_trajectory is not None else 0
 
-    all_sim = np.concatenate(save_list_pts[:T], axis=0)
-    all_gt  = triangulated_3d[:T].reshape(-1, 3)
-    all_pts = np.concatenate([all_sim, all_gt], axis=0)
+    all_pts_list = [np.concatenate(save_list_pts[:T], axis=0)]
+    if T_gt > 0:
+        all_pts_list.append(triangulated_3d[:min(T, T_gt)].reshape(-1, 3))
+    if T_hand > 0:
+        hand_np = hand_trajectory.detach().cpu().numpy() if hasattr(hand_trajectory, 'detach') else np.asarray(hand_trajectory)
+        all_pts_list.append(hand_np[:min(T, T_hand)].reshape(-1, 3))
+    all_pts = np.concatenate(all_pts_list, axis=0)
     pad = 0.15
     xlim = (all_pts[:, 0].min() - pad, all_pts[:, 0].max() + pad)
     ylim = (all_pts[:, 1].min() - pad, all_pts[:, 1].max() + pad)
@@ -517,16 +527,21 @@ def _save_tracking_3d_gif(save_list_pts, triangulated_3d, floor_level, out_path,
 
     for t in range(T):
         sim_pts = save_list_pts[t]
-        gt_pts  = triangulated_3d[t]
 
         fig = plt.figure(figsize=(5, 5), dpi=100)
         fig.patch.set_facecolor('white')
         ax3d = fig.add_subplot(1, 1, 1, projection='3d')
         ax3d.set_facecolor('#f5f5f5')
-        ax3d.scatter(gt_pts[:, 0],  gt_pts[:, 1],  gt_pts[:, 2],
-                     c='green', s=4, alpha=0.7, label='GT (CoTracker)')
+        if t < T_gt:
+            gt_pts = triangulated_3d[t]
+            ax3d.scatter(gt_pts[:, 0],  gt_pts[:, 1],  gt_pts[:, 2],
+                         c='green', s=4, alpha=0.7, label='GT (CoTracker)')
         ax3d.scatter(sim_pts[:, 0], sim_pts[:, 1], sim_pts[:, 2],
                      c='red',   s=4, alpha=0.7, label='Simulated')
+        if t < T_hand:
+            hp = hand_np[t]
+            ax3d.scatter(hp[:, 0], hp[:, 1], hp[:, 2],
+                         c='blue', s=30, alpha=0.9, marker='X', label='Hand')
 
         xs = np.linspace(xlim[0], xlim[1], 4)
         ys = np.linspace(ylim[0], ylim[1], 4)
@@ -556,14 +571,17 @@ def _save_tracking_3d_gif(save_list_pts, triangulated_3d, floor_level, out_path,
 
 
 def _save_tracking_gif_impl(args, save_list_pts, cotracker_tracks, camera, out_path,
-                            n_frames=16, dot_radius=2, track_err=None, view_idx=0):
+                            n_frames=None, dot_radius=2, track_err=None, view_idx=0,
+                            hand_trajectory=None):
     """Implementation: draw tracking dots on frames and save GIF."""
-    if cotracker_tracks is None or len(save_list_pts) == 0:
+    if len(save_list_pts) == 0:
         return
     from PIL import ImageDraw, ImageFont
 
     frames_out = []
-    T = min(n_frames, len(save_list_pts), cotracker_tracks.shape[1])
+    T = len(save_list_pts) if n_frames is None else min(n_frames, len(save_list_pts))
+    T_gt = cotracker_tracks.shape[1] if cotracker_tracks is not None else 0
+    T_hand = hand_trajectory.shape[0] if hand_trajectory is not None else 0
     gt_dir = os.path.join(args.dataset_dir, args.data_name, 'data')
     sim_dir = os.path.join(args.output_dir, args.data_name, 'render_best')
 
@@ -576,22 +594,35 @@ def _save_tracking_gif_impl(args, save_list_pts, cotracker_tracks, camera, out_p
     except Exception:
         font = ImageFont.load_default()
 
-    # Pre-compute projected sim points per frame
+    # Pre-compute projected sim and hand points per frame
     sim_proj_per_frame = []
+    hand_proj_per_frame = []
     for t in range(T):
         sim_pts = torch.tensor(save_list_pts[t], device=device)
         sim_proj_per_frame.append(_project_to_2d(sim_pts, camera).cpu().numpy())
+        if t < T_hand:
+            hand_pts = hand_trajectory[t].to(device) if hasattr(hand_trajectory, 'to') else torch.tensor(hand_trajectory[t], device=device)
+            hand_proj_per_frame.append(_project_to_2d(hand_pts, camera).cpu().numpy())
+        else:
+            hand_proj_per_frame.append(None)
 
-    def _draw_dots(img, gt_pts, sim_proj):
+    def _draw_dots(img, gt_pts, sim_proj, hand_proj):
         draw = ImageDraw.Draw(img)
-        for (x, y) in gt_pts:
-            x, y = float(x), float(y)
-            if np.isfinite(x) and np.isfinite(y):
-                draw.ellipse([x-dot_radius, y-dot_radius, x+dot_radius, y+dot_radius], fill=(0, 220, 0))
+        if gt_pts is not None:
+            for (x, y) in gt_pts:
+                x, y = float(x), float(y)
+                if np.isfinite(x) and np.isfinite(y):
+                    draw.ellipse([x-dot_radius, y-dot_radius, x+dot_radius, y+dot_radius], fill=(0, 220, 0))
         for (x, y) in sim_proj:
             x, y = float(x), float(y)
             if np.isfinite(x) and np.isfinite(y):
                 draw.ellipse([x-dot_radius, y-dot_radius, x+dot_radius, y+dot_radius], fill=(220, 0, 0))
+        if hand_proj is not None:
+            hr = dot_radius + 2
+            for (x, y) in hand_proj:
+                x, y = float(x), float(y)
+                if np.isfinite(x) and np.isfinite(y):
+                    draw.ellipse([x-hr, y-hr, x+hr, y+hr], fill=(50, 120, 255))
         return img
 
     for t in range(T):
@@ -603,11 +634,12 @@ def _save_tracking_gif_impl(args, save_list_pts, cotracker_tracks, camera, out_p
         gt_img  = Image.open(gt_img_path).convert('RGB').copy()
         sim_img = Image.open(sim_img_path).convert('RGB').copy() if os.path.exists(sim_img_path) else Image.new('RGB', (W, H), (200, 200, 200))
 
-        gt_pts   = cotracker_tracks[view_idx, t]
+        gt_pts = cotracker_tracks[view_idx, t] if t < T_gt else None
         sim_proj = sim_proj_per_frame[t]
+        hand_proj = hand_proj_per_frame[t]
 
-        gt_img  = _draw_dots(gt_img,  gt_pts, sim_proj)
-        sim_img = _draw_dots(sim_img, gt_pts, sim_proj)
+        gt_img  = _draw_dots(gt_img,  gt_pts, sim_proj, hand_proj)
+        sim_img = _draw_dots(sim_img, gt_pts, sim_proj, hand_proj)
 
         # Stitch side by side with legend bar
         canvas = Image.new('RGB', (W * 2, H + legend_h), (30, 30, 30))
@@ -620,12 +652,16 @@ def _save_tracking_gif_impl(args, save_list_pts, cotracker_tracks, camera, out_p
         ldraw.text((W + pad, H + pad), 'Simulated', fill=(200, 200, 200), font=font)
 
         # Legend swatches
-        legend_x = W // 2 - 100
+        legend_x = W // 2 - 160
         ldraw.rectangle([legend_x, H + pad, legend_x + 14, H + pad + 14], fill=(0, 220, 0))
         ldraw.text((legend_x + 18, H + pad), 'GT (CoTracker)', fill=(255, 255, 255), font=font)
         legend_x2 = legend_x + 160
         ldraw.rectangle([legend_x2, H + pad, legend_x2 + 14, H + pad + 14], fill=(220, 0, 0))
         ldraw.text((legend_x2 + 18, H + pad), 'Simulated', fill=(255, 255, 255), font=font)
+        if hand_trajectory is not None:
+            legend_x3 = legend_x2 + 120
+            ldraw.rectangle([legend_x3, H + pad, legend_x3 + 14, H + pad + 14], fill=(50, 120, 255))
+            ldraw.text((legend_x3 + 18, H + pad), 'Hand', fill=(255, 255, 255), font=font)
 
         if track_err is not None:
             ldraw.text((W + pad, H + legend_h // 2 + 2), f'TrackErr={track_err:.4f}', fill=(255, 220, 50), font=font)
@@ -652,16 +688,17 @@ def final_simulation(args):
     simulator.load_lbs()
     simulator.initialize_simulator()
 
-    cotracker_tracks = _run_cotracker_multiview(simulator, args.dataset_dir, args.data_name, n_frames=16)
+    cotracker_tracks = _run_cotracker_multiview(simulator, args.dataset_dir, args.data_name, n_frames=simulator.n_sim_frames)
     if cotracker_tracks is not None:
         triangulated_3d = _triangulate_tracks(cotracker_tracks, simulator.gs_context['gs_views'])
     else:
         triangulated_3d = None
 
-    # For future state prediction, you can increase the target step
-    simulator.simulate_fast_forward(target_step=15, view_indices=simulator.total_view_indices, render=True)
+    # Simulate the full sequence (scales with hand trajectory length for interaction cases)
+    n_total = simulator.n_sim_frames
+    simulator.simulate_fast_forward(target_step=n_total - 1, view_indices=simulator.total_view_indices, render=True)
     simulator.save_images(simulator.tag)
-    psnr, ssim = simulator.calculate_metrics(view_indices=simulator.total_view_indices, end_step=16)
+    psnr, ssim = simulator.calculate_metrics(view_indices=simulator.total_view_indices, end_step=n_total)
     track_err = None
     if triangulated_3d is not None:
         track_err = _compute_tracking_metric_3d(simulator.save_list_pts, triangulated_3d)
@@ -690,7 +727,7 @@ def final_simulation(args):
     output_dir = f'{args.output_dir}/{args.data_name}/render_best'
     gt_dir = f'{args.dataset_dir}/{args.data_name}/data'
     pred_imgs, gt_imgs = [], []
-    for i in range(16): 
+    for i in range(simulator.n_sim_frames):
         pred_imgs.append(imageio.imread(f'{output_dir}/r_0_{i}.png'))
         gt_imgs.append(imageio.imread(f'{gt_dir}/r_0_{i}.png'))
     pred_imgs = np.stack(pred_imgs, axis=0)
@@ -700,19 +737,20 @@ def final_simulation(args):
 
     plot_optimization_record(args)
     save_overlay_gif(args)
-    if cotracker_tracks is not None:
+    hand_traj = simulator.hand_trajectory if simulator.hand_trajectory is not None else None
+    if cotracker_tracks is not None or hand_traj is not None:
         gs_views = simulator.gs_context['gs_views']
         for view_idx, camera in enumerate(gs_views):
             suffix = '' if view_idx == 0 else f'_v{view_idx}'
             track_gif_path = f'{args.output_dir}/{args.data_name}/tracking_overlay{suffix}.gif'
             _save_tracking_gif_impl(args, simulator.save_list_pts, cotracker_tracks,
                                     camera, track_gif_path, track_err=track_err,
-                                    view_idx=view_idx)
+                                    view_idx=view_idx, hand_trajectory=hand_traj)
         track_3d_path = f'{args.output_dir}/{args.data_name}/tracking_3d.gif'
         _save_tracking_3d_gif(simulator.save_list_pts, triangulated_3d,
                               simulator.floor_level, track_3d_path,
                               dataset_dir=args.dataset_dir, data_name=args.data_name,
-                              track_err=track_err)
+                              track_err=track_err, hand_trajectory=hand_traj)
 
 def run_recon(args):
 
