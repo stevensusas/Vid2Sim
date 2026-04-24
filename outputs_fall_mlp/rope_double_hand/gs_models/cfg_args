@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/home/steven/project-steven/PhysTwin/vid2sim_dataset_fall/rope_double_hand', model_path='outputs_fall_mlp/rope_double_hand/gs_models', images='images', resolution=-1, white_background=True, data_device='cuda', eval=False)

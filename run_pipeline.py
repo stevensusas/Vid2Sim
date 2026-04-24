@@ -377,35 +377,46 @@ def joint_optimization(args):
             n_total = simulator.n_sim_frames
             simulator.simulate_fast_forward(n_total - 1, simulator.total_view_indices, render=True)
             psnr, ssim = simulator.calculate_metrics(simulator.total_view_indices, end_step=n_total)
-            yms_pred, prs_pred = torch.pow(10, simulator.pred_yms_normalized), simulator.pred_prs_normalized
+            # Per-point field: summarize by mean over cubatures for logging.
+            with torch.no_grad():
+                E_field, nu_field = simulator.material_mlp(simulator.cubature_points)
+            yms_mean = E_field.mean().item()
+            prs_mean = nu_field.mean().item()
             track_err = None
             if triangulated_3d is not None:
                 track_err = _compute_tracking_metric_3d(simulator.save_list_pts, triangulated_3d)
             track_str = f" TrackErr={track_err:.4f}" if track_err is not None else ""
-            print(f"[Iter {iter}]: PSNR={psnr:.4f} SSIM={ssim:.4f}{track_str}  E={yms_pred.item():.2f} ν={prs_pred.item():.4f}")
-            entry = {'psnr': psnr.item(), 'ssim': ssim.item(), 'yms': yms_pred.item(), 'prs': prs_pred.item()}
+            print(f"[Iter {iter}]: PSNR={psnr:.4f} SSIM={ssim:.4f}{track_str}  "
+                  f"E_mean={yms_mean:.2f} ν_mean={prs_mean:.4f}")
+            entry = {'psnr': psnr.item(), 'ssim': ssim.item(), 'yms': yms_mean, 'prs': prs_mean}
             if track_err is not None:
                 entry['track_err'] = track_err
             record['test_list'].append(entry)
             if psnr > best_psnr and ssim > best_ssim: # Save the best model
                 best_psnr, best_ssim = psnr, ssim
                 record['best_psnr'], record['best_ssim'] = psnr.item(), ssim.item()
-                best_params.yms = yms_pred.item()
-                best_params.prs = min(prs_pred.item(), 0.49)
+                best_params.yms = yms_mean
+                best_params.prs = min(prs_mean, 0.49)
                 OmegaConf.save(best_params, f'{args.output_dir}/{args.data_name}/best_params.yaml')
                 torch.save(simulator.lbs_model.state_dict(), f'{args.output_dir}/{args.data_name}/models/model_best.pth')
                 torch.save(simulator.jacobian_model.state_dict(), f'{args.output_dir}/{args.data_name}/models/jmodel_best.pth')
+                torch.save(simulator.material_mlp.state_dict(), f'{args.output_dir}/{args.data_name}/models/material_mlp_best.pth')
+                if simulator.grip_mlp is not None:
+                    torch.save(simulator.grip_mlp.state_dict(), f'{args.output_dir}/{args.data_name}/models/grip_mlp_best.pth')
             simulator.reset_simulator()
-            
+
         if iter != sim_args.optimization_iters:
             view_indices = torch.arange(0, len(simulator.gs_context['gs_views']), device=device, dtype=torch.long)
             simulator.simulate_fast_forward(start_step, view_indices)
             simulator.simulate_with_grad(end_step, view_indices)
             rendering_loss = simulator.update_parameters(view_indices, start_step, end_step)
-            yms_pred, prs_pred = torch.pow(10, simulator.pred_yms_normalized), simulator.pred_prs_normalized
-            record['train_list'].append({'loss': rendering_loss.item(), 'yms': yms_pred.item(), 'prs': prs_pred.item()})
-            
-        pbar.set_description(f"Loss={rendering_loss.item()} E={yms_pred.item()} ν={prs_pred.item()} ")
+            with torch.no_grad():
+                E_field, nu_field = simulator.material_mlp(simulator.cubature_points)
+            yms_mean = E_field.mean().item()
+            prs_mean = nu_field.mean().item()
+            record['train_list'].append({'loss': rendering_loss.item(), 'yms': yms_mean, 'prs': prs_mean})
+
+        pbar.set_description(f"Loss={rendering_loss.item()} E_mean={yms_mean:.1f} ν_mean={prs_mean:.3f} ")
         pbar.set_postfix(lr=float(simulator.mat_optimizer.param_groups[0]['lr']))
         with open(f'{args.output_dir}/{args.data_name}/optimization_record.json', 'w') as f:
             json.dump(record, f)
@@ -497,6 +508,83 @@ def save_overlay_gif(args):
 
     imageio.mimsave(f'{out_dir}/overlay.gif', blended, fps=8, loop=0)
     print(f"Saved overlay GIF → {out_dir}/overlay.gif")
+
+
+def save_material_field_gif(simulator, out_path, elev=25, azim=-45):
+    """Static 3D scatter of cubature points colored by (log E, ν) from MaterialMLP.
+
+    Two-panel image: left is Young's modulus (log color scale), right is Poisson
+    ratio. Uses a single front-right view with some elevation — spinning
+    obscured the per-point variation. Color range is auto-scaled to the data
+    percentile range so the spatial field stands out, with the MLP's configured
+    bounds shown alongside for absolute reference.
+
+    Writes PNG if `out_path` ends in .png, else GIF (one-frame) for compatibility.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib import cm
+    import imageio
+
+    # Sample the MaterialMLP at all Gaussian positions (not just cubatures) so
+    # the full spatial extent of the field is visible. Cubatures are where the
+    # simulator evaluates material forces, but the MLP is a continuous function
+    # and interpolates smoothly elsewhere.
+    sample_pts = simulator.points
+    simulator.material_mlp.eval()
+    with torch.no_grad():
+        E, nu = simulator.material_mlp(sample_pts)
+    pts = sample_pts.detach().cpu().numpy()
+    E_np = E.detach().cpu().numpy()
+    nu_np = nu.detach().cpu().numpy()
+    log_E = np.log10(np.clip(E_np, 1e-6, None))
+    bounds = simulator.material_mlp.bounds
+
+    # Auto-scale color to [5, 95] percentile for contrast; clip to MLP bounds.
+    def _auto_range(vals, floor_min, floor_max, min_span):
+        lo, hi = np.percentile(vals, [5, 95])
+        if hi - lo < min_span:
+            mid = 0.5 * (lo + hi)
+            lo, hi = mid - min_span / 2, mid + min_span / 2
+        return max(lo, floor_min), min(hi, floor_max)
+
+    log_E_lo, log_E_hi = _auto_range(log_E, np.log10(bounds["E"][0]),
+                                     np.log10(bounds["E"][1]), 0.3)
+    nu_lo, nu_hi = _auto_range(nu_np, bounds["nu"][0], bounds["nu"][1], 0.02)
+
+    pad = 0.08 * (pts.max(axis=0) - pts.min(axis=0)).max()
+    xmin, ymin, zmin = pts.min(axis=0) - pad
+    xmax, ymax, zmax = pts.max(axis=0) + pad
+
+    fig = plt.figure(figsize=(11, 5), dpi=120)
+    for panel_idx, (title, vals, vlo, vhi, cmap_name) in enumerate([
+        (f"log10(E)  vis=[{log_E_lo:.2f},{log_E_hi:.2f}]  bounds=[{np.log10(bounds['E'][0]):.1f},{np.log10(bounds['E'][1]):.1f}]",
+         log_E, log_E_lo, log_E_hi, "viridis"),
+        (f"ν  vis=[{nu_lo:.3f},{nu_hi:.3f}]  bounds=[{bounds['nu'][0]:.2f},{bounds['nu'][1]:.2f}]",
+         nu_np, nu_lo, nu_hi, "plasma"),
+    ]):
+        ax = fig.add_subplot(1, 2, panel_idx + 1, projection="3d")
+        sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
+                        c=vals, cmap=cm.get_cmap(cmap_name), vmin=vlo, vmax=vhi,
+                        s=2, alpha=0.6)
+        ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax); ax.set_zlim(zmin, zmax)
+        ax.set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(title, fontsize=8)
+        ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+        fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.05)
+    fig.tight_layout()
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    frame = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[..., :3].copy()
+    plt.close(fig)
+
+    if out_path.lower().endswith(".png"):
+        imageio.imwrite(out_path, frame)
+    else:
+        imageio.mimsave(out_path, [frame], fps=1, loop=0)
+    print(f"Saved material field viz → {out_path}")
 
 
 def _save_tracking_3d_gif(save_list_pts, triangulated_3d, floor_level, out_path,
@@ -682,7 +770,17 @@ def final_simulation(args):
     sim_args.yms = best_params.yms
     sim_args.prs = best_params.prs 
     simulator = LBSSimulator(sim_args, args.dataset_dir, args.output_dir, args.data_name)
-    simulator.set_material() 
+    simulator.set_material()
+    # Load trained MaterialMLP / GripMLP state dicts so the eval sim uses the
+    # per-point field that was learned during Stage II joint optimization.
+    mat_mlp_path = f'{args.output_dir}/{args.data_name}/models/material_mlp_best.pth'
+    if os.path.exists(mat_mlp_path):
+        simulator.material_mlp.load_state_dict(torch.load(mat_mlp_path, map_location=simulator.device))
+        print(f"[Final] Loaded MaterialMLP from {mat_mlp_path}")
+    grip_mlp_path = f'{args.output_dir}/{args.data_name}/models/grip_mlp_best.pth'
+    if simulator.grip_mlp is not None and os.path.exists(grip_mlp_path):
+        simulator.grip_mlp.load_state_dict(torch.load(grip_mlp_path, map_location=simulator.device))
+        print(f"[Final] Loaded GripMLP from {grip_mlp_path}")
     simulator.load_lbs()
     simulator.initialize_simulator()
 
@@ -720,6 +818,11 @@ def final_simulation(args):
     annotation = dict(iter=best_iter, E=best_params.yms, nu=best_params.prs,
                       psnr=psnr.item(), ssim=ssim.item())
     simulator.save_pointcloud_gif(simulator.tag, annotation=annotation)
+
+    save_material_field_gif(
+        simulator,
+        f'{args.output_dir}/{args.data_name}/material_field.gif',
+    )
 
     # Visualize the simulation results at front view
     output_dir = f'{args.output_dir}/{args.data_name}/render_best'

@@ -14,6 +14,7 @@ from simulators.sim_utils.physics import newton_E, newton_G, newton_H, train_ste
 from simulators.sim_utils.gaussians import render_gs, build_covariance_from_scaling_rotation_deformations
 from simulators.sim_utils.optimization import newtons_method 
 from simulators.sim_utils.material import NeohookeanMaterial
+from simulators.material_mlp import MaterialMLP, GripMLP, WeightedBoundary
 from tqdm import tqdm
  
 class LBSSimulator():
@@ -122,30 +123,50 @@ class LBSSimulator():
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
  
     def set_material(self):
- 
-        self.point_wise_rho = torch.ones_like(self.points[:, 0:1]) * self.rho
-        self.cubature_point_wise_rho = torch.ones_like(self.cubature_points[:, 0:1]) * self.rho 
 
-        if self.optimization: 
-            init_yms = self.args.yms
-            init_prs = self.args.prs 
-            self.pred_yms_normalized = torch.nn.Parameter(torch.tensor(np.log10(init_yms), device=self.device).float())
-            self.pred_prs_normalized = torch.nn.Parameter(torch.tensor(init_prs, device=self.device).float()) 
-            self.mat_optimizer = torch.optim.Adam([{'params': [self.pred_yms_normalized], 'lr': 5e-3}, 
-                                                {'params': [self.pred_prs_normalized], 'lr': 1e-3},
-                                                {'params': self.lbs_model.parameters(), 'lr': 5e-7},
-                                                {'params': self.jacobian_model.parameters(), 'lr': 5e-7}])
-            print(f'[Joint Optimization] Initial Material Parameters: E={init_yms} ν={init_prs}')
+        self.point_wise_rho = torch.ones_like(self.points[:, 0:1]) * self.rho
+        self.cubature_point_wise_rho = torch.ones_like(self.cubature_points[:, 0:1]) * self.rho
+
+        # Per-point MaterialMLP replaces the scalar (yms, prs) parameters in both
+        # optimization and eval modes. Bias init sets the initial output to
+        # (args.yms, args.prs) so the field starts homogeneous and learns spatial
+        # variation during optimization.
+        init_yms = float(self.args.yms)
+        init_prs = float(min(self.args.prs, 0.49))
+        self.material_mlp = MaterialMLP(initial_E=init_yms, initial_nu=init_prs).to(self.device)
+
+        # GripMLP (per-controller grip weight) is only meaningful if there's a
+        # hand trajectory; otherwise keep it None. Base coeff stays the same.
+        has_hand = os.path.exists(os.path.join(self.dataset_dir, self.data_name, 'hand_trajectory.npy'))
+        self.boundary_base_coeff = 5000.0
+        self.grip_mlp = GripMLP().to(self.device) if has_hand else None
+
+        # Evaluate MLP once so downstream code that reads cubature_point_wise_*
+        # before initialize_simulator() sees valid tensors.
+        with torch.no_grad():
+            E_init, nu_init = self.material_mlp(self.cubature_points)
+            self.cubature_point_wise_yms = E_init.detach().unsqueeze(-1)
+            self.cubature_point_wise_prs = nu_init.detach().unsqueeze(-1)
+            # point_wise_* are used by data-free LBS refinement only — broadcast the
+            # initial scalar since the LBS pretraining expects homogeneous material.
+            self.point_wise_yms = torch.full_like(self.points[:, 0:1], init_yms)
+            self.point_wise_prs = torch.full_like(self.points[:, 0:1], init_prs)
+
+        if self.optimization:
+            param_groups = [
+                {'params': self.material_mlp.parameters(), 'lr': 5e-3},
+                {'params': self.lbs_model.parameters(), 'lr': 5e-7},
+                {'params': self.jacobian_model.parameters(), 'lr': 5e-7},
+            ]
+            if self.grip_mlp is not None:
+                param_groups.append({'params': self.grip_mlp.parameters(), 'lr': 1e-3})
+            self.mat_optimizer = torch.optim.Adam(param_groups)
+            print(f'[Joint Optimization] Initial Material Parameters: E={init_yms} ν={init_prs} '
+                  f'(MaterialMLP{" + GripMLP" if self.grip_mlp is not None else ""})')
         else:
-            self.yms, self.prs = self.args.yms, min(self.args.prs, 0.49)
-            self.point_wise_yms = torch.ones_like(self.points[:, 0:1]) * self.yms
-            self.point_wise_prs = torch.ones_like(self.points[:, 0:1]) * self.prs
-            self.cubature_point_wise_yms = torch.ones_like(self.cubature_points[:, 0:1]) * self.yms
-            self.cubature_point_wise_prs = torch.ones_like(self.cubature_points[:, 0:1]) * self.prs 
-            self.pred_yms_normalized = None
-            self.pred_prs_normalized = None
-            print(f'[Simulation] Material Parameters: E={self.yms} ν={self.prs}')
-             
+            print(f'[Simulation] Material Parameters: initialized at E={init_yms} ν={init_prs} '
+                  f'(MaterialMLP{" + GripMLP" if self.grip_mlp is not None else ""})')
+
         self.grav = torch.zeros(3, device=self.device)
         self.grav[self.floor_axis] = self.gravity_magnitude
         print(f'[Simulation] Gravity: {self.gravity_magnitude:.4f} (floor_axis={self.floor_axis})')
@@ -257,10 +278,12 @@ class LBSSimulator():
         self.skinning_weights = self.lbs_model_plus_rigid(self.points)
         self.skinning_weights_cubature = self.lbs_model_plus_rigid(self.cubature_points)
 
-        if self.optimization:
-            self.cubature_point_wise_yms = torch.ones_like(self.cubature_points[:, 0:1]) * torch.pow(10, self.pred_yms_normalized)
-            clamped_prs = torch.clamp(self.pred_prs_normalized, -0.99, 0.49)
-            self.cubature_point_wise_prs = torch.ones_like(self.cubature_points[:, 0:1]) * clamped_prs
+        # Per-point material field from MaterialMLP (replaces scalar broadcast).
+        # Always recompute so that opt-mode gradients flow through the MLP and
+        # eval-mode picks up the loaded state dict.
+        E_field, nu_field = self.material_mlp(self.cubature_points)
+        self.cubature_point_wise_yms = E_field.unsqueeze(-1)
+        self.cubature_point_wise_prs = nu_field.unsqueeze(-1)
         
         if self.dFdz is None or self.optimization:
             self.M, self.invM = physics.simplicits.precomputed.lumped_mass_matrix(self.cubature_point_wise_rho, self.particle_volume, dim=3)
@@ -324,18 +347,27 @@ class LBSSimulator():
             tree = cKDTree(cub_np)
             _, nn_idx = tree.query(hand0_np, k=1)  # (N_ctrl,)
             self.hand_constraint_indices = torch.tensor(nn_idx, dtype=torch.long, device=self.device)
-            # Build Boundary object and initialize with frame-0 positions
-            self.boundary_object = physics.utils.Boundary()
+            # Build WeightedBoundary object and initialize with frame-0 positions.
+            # Per-cubature weights are produced by GripMLP (gated in set_material),
+            # multiplied by a base coeff; scalar coeff=1 in the Kaolin wrappers.
+            self.boundary_object = WeightedBoundary()
             self.boundary_object.set_pinned_verts(
                 idx=self.hand_constraint_indices,
                 pos=self.hand_trajectory[0],
             )
+            if self.grip_mlp is not None:
+                grip_weights = self.grip_mlp(self.cubature_points[self.hand_constraint_indices])
+                self.boundary_object.set_pinned_weights(self.boundary_base_coeff * grip_weights)
+            else:
+                self.boundary_object.set_pinned_weights(
+                    torch.full((self.hand_constraint_indices.shape[0],),
+                               self.boundary_base_coeff, device=self.device))
             self.partial_boundary_e = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_scene_energy(
-                self.boundary_object, self.B, coeff=5000.0, integration_sampling=None)
+                self.boundary_object, self.B, coeff=1.0, integration_sampling=None)
             self.partial_boundary_g = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_scene_gradient(
-                self.boundary_object, self.B, coeff=5000.0, integration_sampling=None)
+                self.boundary_object, self.B, coeff=1.0, integration_sampling=None)
             self.partial_boundary_h = physics.simplicits.simplicits_scene_forces.generate_fcn_simplicits_scene_hessian(
-                self.boundary_object, self.B, coeff=5000.0, integration_sampling=None)
+                self.boundary_object, self.B, coeff=1.0, integration_sampling=None)
             print(f'[Simulation] Hand trajectory loaded: {hand_traj.shape}, '
                   f'N_ctrl={hand_traj.shape[1]}, T={hand_traj.shape[0]}')
         else:
