@@ -47,14 +47,20 @@ class LBSSimulator():
         self.simulation_newton_iters = args.simulation_newton_iters
         # Gravity normalized by object mass relative to double_stretch_zebra (reference).
         # PhysTwin writes n_nodes (= total structure points, each with mass 1) to sim_config.yaml.
-        G_BASE = 7.5  # tuned for double_stretch_zebra
-        import yaml
-        n_nodes = args.n_nodes
-        ref_sim_config_path = os.path.join(dataset_dir, 'double_stretch_zebra', 'sim_config.yaml')
-        with open(ref_sim_config_path, 'r') as f:
-            ref_cfg = yaml.safe_load(f)
-        n_nodes_ref = ref_cfg['n_nodes']
-        self.gravity_magnitude = G_BASE * n_nodes / n_nodes_ref
+        # Interaction cases (hand_trajectory.npy present): use standard gravity
+        # 9.8 so all cases are comparable. Gravity cases keep the mesh-density
+        # scaling tuned against double_stretch_zebra.
+        if os.path.exists(os.path.join(dataset_dir, data_name, 'hand_trajectory.npy')):
+            self.gravity_magnitude = 9.8
+        else:
+            import yaml
+            G_BASE = 7.5 / 4.0  # 1/4 of original gravity to match PhysTwin regen
+            n_nodes = args.n_nodes
+            ref_sim_config_path = os.path.join(dataset_dir, 'double_stretch_zebra', 'sim_config.yaml')
+            with open(ref_sim_config_path, 'r') as f:
+                ref_cfg = yaml.safe_load(f)
+            n_nodes_ref = ref_cfg['n_nodes']
+            self.gravity_magnitude = G_BASE * n_nodes / n_nodes_ref
 
         if args.model_type == 'gs':
             gaussians, gs_context = load_gaussians(dataset_dir, output_dir, data_name, self.tag)
@@ -64,12 +70,18 @@ class LBSSimulator():
         else:
             raise ValueError(f'Unknown model type: {args.model_type}')
         
-        # Determine simulation frame count: use hand trajectory length if present, else default 24.
+        # Determine simulation frame count: hand trajectory length for interaction,
+        # or count the per-frame rendered PNGs for fall cases (was hardcoded 24).
         hand_traj_path = os.path.join(dataset_dir, data_name, 'hand_trajectory.npy')
         if os.path.exists(hand_traj_path):
             self.n_sim_frames = np.load(hand_traj_path, mmap_mode='r').shape[0]
         else:
-            self.n_sim_frames = 24
+            import re
+            data_dir = os.path.join(dataset_dir, data_name, 'data')
+            frames = {int(m.group(1))
+                      for f in os.listdir(data_dir)
+                      for m in [re.match(r'^a_0_(\d+)\.png$', f)] if m}
+            self.n_sim_frames = max(frames) + 1 if frames else 24
 
         if args.model_type == 'gs':
             self.points = gaussians.get_xyz.clone().detach().to(device)
@@ -85,6 +97,15 @@ class LBSSimulator():
 
         self.cubature_points, self.cubature_points_idx = load_cubature_points(self.points, self.num_cubature_points)
         self.points = self.points.to(device)
+
+        # Interaction cases: override sim_config.yaml's floor_level — the exported
+        # value doesn't land below the object in Vid2Sim coords. Anchor the floor
+        # just below the object's lowest point so it rests on the floor at t=0.
+        if os.path.exists(os.path.join(dataset_dir, data_name, 'hand_trajectory.npy')):
+            obj_min = self.points[:, self.floor_axis].min().item()
+            self.floor_level = obj_min
+            print(f'[Simulation] Interaction case: floor_level auto-set to '
+                  f'{self.floor_level:.4f} (object min on axis {self.floor_axis})')
 
         if gaussians is not None:
             self.gaussians = gaussians 
