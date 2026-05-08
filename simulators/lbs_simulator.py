@@ -153,8 +153,12 @@ class LBSSimulator():
             self.point_wise_prs = torch.full_like(self.points[:, 0:1], init_prs)
 
         if self.optimization:
+            # MaterialMLP LR: 1e-4 chosen for tracking-loss supervision (per-point
+            # L2 distances ~0.2 produce O(1) gradients on the MLP head; the old
+            # 5e-3 LR — tuned for ~0.001-magnitude rendering-MSE — overshoots,
+            # saturating sigmoid bounds within a few iters).
             param_groups = [
-                {'params': self.material_mlp.parameters(), 'lr': 5e-3},
+                {'params': self.material_mlp.parameters(), 'lr': 1e-4},
                 {'params': self.lbs_model.parameters(), 'lr': 5e-7},
                 {'params': self.jacobian_model.parameters(), 'lr': 5e-7},
             ]
@@ -263,11 +267,14 @@ class LBSSimulator():
         torch.cuda.empty_cache()
         self.z = torch.zeros(self.skinning_weights_cubature.shape[1] * 12,
             device=self.device, dtype=torch.float32).unsqueeze(-1)
-        self.z_dot = torch.zeros_like(self.z, device=self.device) 
+        self.z_dot = torch.zeros_like(self.z, device=self.device)
         self.current_step = 0
         self.save_list = []
         self.save_list_bg = []
         self.save_list_pts = []
+        # Grad-bearing copies of cubature positions for tracking-loss supervision.
+        # Aligned with save_list_pts (numpy detach) — populated in render_frame.
+        self.save_list_pts_tensors = []
 
     def initialize_simulator(self):
  
@@ -417,6 +424,7 @@ class LBSSimulator():
             else:
                 x_cubature = (self.B @ self.z + self.x0_flat).reshape(-1, 3)
             self.save_list_pts.append(x_cubature.clone().detach().cpu().numpy())
+            self.save_list_pts_tensors.append(x_cubature)
         elif self.args.model_type == 'mesh':
             self.save_list.append(x_pts_full.clone().detach().cpu().numpy())
 
@@ -593,5 +601,23 @@ class LBSSimulator():
         loss = self.calculate_loss(view_indices, start_step, end_step)
         self.mat_optimizer.zero_grad()
         loss.backward(retain_graph=True)
-        self.mat_optimizer.step() 
+        self.mat_optimizer.step()
+        return loss
+
+    def calculate_tracking_loss(self, gt_track_3d, start_step, end_step):
+        """Mean per-frame L2 distance between simulated and triangulated cubatures.
+
+        gt_track_3d: tensor (T_total, N_cub, 3) on the simulator's device.
+        save_list_pts_tensors covers absolute frames [start_step, end_step).
+        """
+        sim_pts = torch.stack(self.save_list_pts_tensors, dim=0)  # (W, N, 3)
+        gt_pts = gt_track_3d[start_step:end_step]                  # (W, N, 3)
+        n = min(sim_pts.shape[0], gt_pts.shape[0])
+        return torch.norm(sim_pts[:n] - gt_pts[:n], dim=-1).mean()
+
+    def update_parameters_tracking(self, gt_track_3d, start_step, end_step):
+        loss = self.calculate_tracking_loss(gt_track_3d, start_step, end_step)
+        self.mat_optimizer.zero_grad()
+        loss.backward(retain_graph=True)
+        self.mat_optimizer.step()
         return loss

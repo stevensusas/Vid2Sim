@@ -357,6 +357,15 @@ def joint_optimization(args):
     else:
         triangulated_3d = None
 
+    # Tracking loss is now the sole supervision signal — pre-build a GPU tensor
+    # of triangulated cubature targets aligned with sim time. PSNR/SSIM still
+    # computed at validation but never backproped through.
+    if triangulated_3d is None:
+        raise RuntimeError(
+            "Joint optimization requires triangulated 3D tracks (cotracker output) "
+            "since tracking loss is the sole supervision signal. None available.")
+    gt_track_3d_tensor = torch.tensor(triangulated_3d, dtype=torch.float32, device=device)
+
     record = {}
     record['train_list'] = []
     record['test_list'] = []
@@ -366,6 +375,7 @@ def joint_optimization(args):
     pbar = trange(sim_args.optimization_iters + 1)
     best_psnr = 0
     best_ssim = 0
+    best_track = float('inf')
 
     for iter in pbar:
 
@@ -392,9 +402,14 @@ def joint_optimization(args):
             if track_err is not None:
                 entry['track_err'] = track_err
             record['test_list'].append(entry)
-            if psnr > best_psnr and ssim > best_ssim: # Save the best model
+            # Best-iter is now selected by tracking loss (the actual supervision
+            # signal), not PSNR/SSIM. PSNR/SSIM are reported for reference only.
+            improved = (track_err is not None and track_err < best_track)
+            if improved:
+                best_track = track_err
                 best_psnr, best_ssim = psnr, ssim
                 record['best_psnr'], record['best_ssim'] = psnr.item(), ssim.item()
+                record['best_track'] = best_track
                 best_params.yms = yms_mean
                 best_params.prs = min(prs_mean, 0.49)
                 OmegaConf.save(best_params, f'{args.output_dir}/{args.data_name}/best_params.yaml')
@@ -409,7 +424,9 @@ def joint_optimization(args):
             view_indices = torch.arange(0, len(simulator.gs_context['gs_views']), device=device, dtype=torch.long)
             simulator.simulate_fast_forward(start_step, view_indices)
             simulator.simulate_with_grad(end_step, view_indices)
-            rendering_loss = simulator.update_parameters(view_indices, start_step, end_step)
+            # Tracking-only supervision: backprop through cubature L2 vs GT 3D tracks.
+            rendering_loss = simulator.update_parameters_tracking(
+                gt_track_3d_tensor, start_step, end_step)
             with torch.no_grad():
                 E_field, nu_field = simulator.material_mlp(simulator.cubature_points)
             yms_mean = E_field.mean().item()
